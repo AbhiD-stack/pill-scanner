@@ -1,0 +1,50 @@
+generic_name,category,common_brands,notes
+acetaminophen,OTC,Tylenol,pain/fever - many strengths (325/500/650mg) and store brands
+ibuprofen,OTC,Advil;Motrin,many strengths (200/400/600/800mg) and store brands
+naproxen sodium,OTC,Aleve,
+aspirin,OTC,Bayer;Bufferin,plain + enteric-coated + low-dose 81mg
+acetaminophen/diphenhydramine,OTC,Tylenol PM,combination sleep+pain
+loratadine,OTC,Claritin,
+cetirizine,OTC,Zyrtec,
+fexofenadine,OTC,Allegra,
+diphenhydramine,OTC,Benadryl,
+chlorpheniramine,OTC,Chlor-Trimeton,
+loratadine/pseudoephedrine,OTC,Claritin-D,behind-counter due to pseudoephedrine
+omeprazole,OTC,Prilosec OTC,
+esomeprazole,OTC,Nexium 24HR,
+lansoprazole,OTC,Prevacid 24HR,
+famotidine,OTC,Pepcid AC,
+calcium carbonate,OTC,Tums,antacid
+calcium carbonate/magnesium hydroxide,OTC,Rolaids,antacid
+simethicone,OTC,Gas-X,
+loperamide,OTC,Imodium,
+bismuth subsalicylate,OTC,Pepto-Bismol,tablet form
+docusate sodium,OTC,Colace,
+polyethylene glycol 3350,OTC,Miralax,powder but has tablet-adjacent recognition value
+bisacodyl,OTC,Dulcolax,
+sennosides,OTC,Senokot,
+dextromethorphan,OTC,Delsym,
+guaifenesin,OTC,Mucinex,
+guaifenesin/dextromethorphan,OTC,Mucinex DM,
+phenylephrine,OTC,Sudafed PE,
+pseudoephedrine,OTC,Sudafed,behind-counter
+acetaminophen/dextromethorphan/phenylephrine,OTC,DayQuil,
+doxylamine/acetaminophen/dextromethorphan,OTC,NyQuil,
+diphenhydramine (sleep aid),OTC,Unisom SleepGels;ZzzQuil,
+doxylamine succinate,OTC,Unisom SleepTabs,
+melatonin,OTC,Natrol;generic,supplement - very common
+meclizine,OTC,Dramamine (less drowsy),
+dimenhydrinate,OTC,Dramamine (original),
+multivitamin adult,OTC,Centrum;One A Day,supplement
+vitamin D3,OTC,Nature Made,supplement - extremely common
+vitamin C,OTC,Nature Made,supplement
+biotin,OTC,Nature's Bounty,supplement
+fish oil / omega-3,OTC,Nature Made,supplement - softgel not tablet, lower priority
+folic acid,OTC,generic,supplement
+iron (ferrous sulfate),OTC,Feosol,supplement
+calcium + vitamin D,OTC,Citracal;Caltrate,supplement
+glucosamine/chondroitin,OTC,Osteo Bi-Flex,supplement
+probiotic,OTC,Align,supplement - capsule form
+nicotine lozenge,OTC,Nicorette,smoking cessation
+ibuprofen/famotidine,OTC,Duexis-style combo (Rx not OTC - verify),verify RX/OTC status before including
+naproxen/esomeprazole,OTC,Vimovo-style combo (Rx not OTC - verify),verify RX/OTC status before including

@@ -1,0 +1,151 @@
+generic_name,category,tier,notes
+atorvastatin,RX,1,statin; extremely stable #1-3 rank for years
+levothyroxine,RX,1,
+metformin,RX,1,
+lisinopril,RX,1,
+amlodipine,RX,1,
+metoprolol tartrate,RX,1,
+metoprolol succinate ER,RX,1,
+albuterol,RX,1,
+omeprazole,RX,1,also sold OTC as Prilosec OTC
+losartan,RX,1,
+gabapentin,RX,1,
+hydrochlorothiazide,RX,1,
+sertraline,RX,1,
+simvastatin,RX,1,
+escitalopram,RX,1,
+rosuvastatin,RX,1,
+bupropion,RX,1,
+furosemide,RX,1,
+pantoprazole,RX,1,
+trazodone,RX,1,
+fluticasone propionate nasal,RX,1,
+duloxetine,RX,1,
+tamsulosin,RX,1,
+prednisone,RX,1,
+amoxicillin,RX,1,
+alprazolam,RX,1,
+citalopram,RX,1,
+meloxicam,RX,1,
+clopidogrel,RX,1,
+azithromycin,RX,1,
+warfarin,RX,1,
+cyclobenzaprine,RX,1,
+carvedilol,RX,1,
+venlafaxine ER,RX,1,
+insulin glargine,RX,2,injectable - image ID less relevant, low priority
+montelukast,RX,1,
+pravastatin,RX,1,
+hydrocodone/acetaminophen,RX,1,controlled substance
+tramadol,RX,1,
+potassium chloride ER,RX,2,
+lorazepam,RX,1,controlled substance
+clonazepam,RX,1,controlled substance
+cholecalciferol (vitamin D3) high-dose,RX,2,
+spironolactone,RX,1,
+allopurinol,RX,1,
+amitriptyline,RX,1,
+buspirone,RX,1,
+famotidine,RX,1,also sold OTC as Pepcid AC
+zolpidem,RX,1,controlled substance
+atenolol,RX,1,
+diazepam,RX,1,controlled substance
+glipizide,RX,1,
+ezetimibe,RX,1,
+doxycycline hyclate,RX,1,
+cephalexin,RX,1,
+ciprofloxacin,RX,1,
+levofloxacin,RX,1,
+clindamycin,RX,1,
+fluoxetine,RX,1,
+paroxetine,RX,1,
+quetiapine,RX,1,
+risperidone,RX,1,
+aripiprazole,RX,1,
+olanzapine,RX,1,
+lamotrigine,RX,1,
+levetiracetam,RX,1,
+topiramate,RX,1,
+divalproex sodium ER,RX,1,
+phenytoin,RX,2,
+carbamazepine,RX,2,
+oxycodone,RX,1,controlled substance
+oxycodone/acetaminophen,RX,1,controlled substance
+morphine sulfate ER,RX,2,controlled substance
+methylphenidate,RX,1,controlled substance
+amphetamine/dextroamphetamine,RX,1,controlled substance - Adderall
+lisdexamfetamine,RX,1,controlled substance - Vyvanse
+atomoxetine,RX,2,
+sildenafil,RX,1,
+tadalafil,RX,1,
+finasteride,RX,2,
+metronidazole,RX,1,
+sulfamethoxazole/trimethoprim,RX,1,
+nitrofurantoin,RX,1,
+valacyclovir,RX,1,
+acyclovir,RX,1,
+prednisolone,RX,2,
+methylprednisolone dose pack,RX,1,
+budesonide,RX,2,
+tiotropium,RX,2,inhaler - low imaging priority
+cetirizine,RX,1,also sold OTC as Zyrtec
+loratadine,RX,1,also sold OTC as Claritin
+fexofenadine,RX,1,also sold OTC as Allegra
+diphenhydramine,RX,1,also sold OTC as Benadryl
+promethazine,RX,1,
+ondansetron,RX,1,
+metoclopramide,RX,2,
+docusate sodium,RX,1,also sold OTC as Colace
+polyethylene glycol 3350,RX,1,also sold OTC as Miralax
+lactulose,RX,2,
+hydralazine,RX,2,
+clonidine,RX,2,
+diltiazem ER,RX,2,
+verapamil ER,RX,2,
+nifedipine ER,RX,2,
+digoxin,RX,2,
+apixaban,RX,1,
+rivaroxaban,RX,1,
+dabigatran,RX,2,
+cyanocobalamin (vitamin B12),RX,2,
+folic acid,RX,2,also sold OTC
+ferrous sulfate,RX,1,also sold OTC iron supplement
+calcium acetate,RX,2,
+sevelamer,RX,2,
+sitagliptin,RX,2,
+glimepiride,RX,2,
+pioglitazone,RX,2,
+empagliflozin,RX,1,
+dapagliflozin,RX,2,
+liraglutide,RX,2,injectable
+semaglutide oral,RX,1,rapidly rising - Rybelsus
+tirzepatide,RX,2,injectable but rapidly rising RX volume
+mirtazapine,RX,1,
+desvenlafaxine,RX,2,
+vortioxetine,RX,2,
+buprenorphine/naloxone,RX,2,controlled substance
+naltrexone,RX,2,
+disulfiram,RX,2,
+propranolol,RX,1,
+labetalol,RX,2,
+sotalol,RX,2,
+amiodarone,RX,2,
+isosorbide mononitrate,RX,2,
+nitroglycerin SL,RX,2,
+colchicine,RX,2,
+febuxostat,RX,2,
+methotrexate,RX,2,
+hydroxychloroquine,RX,2,
+prednisone dose pack,RX,2,
+dexamethasone,RX,2,
+triamcinolone,RX,2,
+azelastine,RX,2,nasal spray - low imaging priority
+mometasone,RX,2,nasal spray - low imaging priority
+benzonatate,RX,1,
+guaifenesin with codeine,RX,2,
+lidocaine patch,RX,2,topical - low imaging priority
+gabapentin ER,RX,2,
+pregabalin,RX,1,controlled substance
+baclofen,RX,1,
+tizanidine,RX,2,
+methocarbamol,RX,2,
