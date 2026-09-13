@@ -75,7 +75,32 @@ def parse_spl_bytes(xml_bytes: bytes, rx_or_otc: str) -> list[SplPillRecord]:
     return _parse_root(root, rx_or_otc)
 
 
+def _document_image_refs(root) -> list[str]:
+    """Real DailyMed documents (confirmed against a live sample — the
+    archived pillbox-data-process script's SPLIMAGE-characteristic approach
+    does not apply here, that characteristic type simply isn't present)
+    reference package-label photos via <observationMedia><value
+    mediaType="image/..."><reference value="foo.jpg"/></value></observationMedia>
+    blocks that live in a completely separate part of the document (package
+    label sections) from the manufacturedProduct/characteristic elements —
+    not nested under the product at all. These are typically package/box
+    photos, not always an isolated loose-pill shot.
+    """
+    refs = []
+    for om in root.iterfind(".//v3:observationMedia", NS):
+        ref = om.find("./v3:value/v3:reference", NS)
+        if ref is not None and ref.get("value"):
+            refs.append(ref.get("value"))
+    return refs
+
+
 def _parse_root(root, rx_or_otc: str) -> list[SplPillRecord]:
+    # Document-level image list — most SPL documents describe one product
+    # (possibly at several package sizes), so attach every image found
+    # anywhere in the document to every NDC record produced from it, rather
+    # than trying to correlate a specific package section to a specific NDC.
+    document_image_refs = _document_image_refs(root)
+
     setid_el = root.find(".//v3:setId", NS)
     setid = setid_el.get("root") if setid_el is not None else None
 
@@ -131,7 +156,11 @@ def _parse_root(root, rx_or_otc: str) -> list[SplPillRecord]:
                 shape=attrs["SPLSHAPE"][0] if attrs["SPLSHAPE"] else None,
                 score_marks=attrs["SPLSCORE"][0] if attrs["SPLSCORE"] else None,
                 size_mm=attrs["SPLSIZE"][0] if attrs["SPLSIZE"] else None,
-                image_refs=list(attrs["SPLIMAGE"]),
+                # SPLIMAGE-characteristic (attrs["SPLIMAGE"]) kept as a
+                # harmless fallback in case some documents do use it, but
+                # document_image_refs (from observationMedia) is the one
+                # confirmed to actually exist in real data.
+                image_refs=list(dict.fromkeys(attrs["SPLIMAGE"] + document_image_refs)),
             ))
 
     return records
