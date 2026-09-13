@@ -58,13 +58,30 @@ parsing logic in HHS's archived `pillbox-data-process` repo (the actual
 source of this imprint/color/shape/score extraction approach — a newer-
 looking alternative, `pharmaDB/dailymed_data_processor`, was checked and
 turned out to only handle label text/history, not images or physical
-characteristics, so it wasn't a useful base). It's unit-tested against a
-synthetic SPL XML fixture, not yet run against a real bulk zip.
+characteristics, so it wasn't a useful base). Confirmed via a live pull
+against `dm_spl_release_human_otc_part1.zip`: DailyMed's bulk zip is
+actually a **zip of per-document zips** (e.g. `otc/20090619_....zip`), each
+flat inside (one XML + its referenced image(s) as direct siblings, no
+subfolder) — this was not obvious from the resources page alone and the
+parser/acquisition notebook were both corrected to match once confirmed
+against a real sample, not assumed. `dm_spl_release_human_otc_part1.zip`'s
+first sample document was a real Bonine (meclizine) OTC product image,
+confirming actual US OTC coverage.
+
+**Runs as its own notebook now**: `notebooks/dailymed_acquisition.ipynb`,
+separate from the training notebook, so a multi-hour unattended download
+doesn't need the training notebook's GPU and can be committed
+("Save & Run All") to run as a batch job that survives you closing the
+laptop — an earlier attempt at downloading inline inside the training
+notebook lost progress to an interactive-session idle timeout. Confirmed
+live: DailyMed currently has 11 OTC parts + 6 RX parts (vs. the 3+2 assumed
+from 2016-era references) — the acquisition notebook discovers whatever
+currently exists from the live resources page rather than a hardcoded count.
 
 Known limitation: the parser only handles the common single-part
 `<manufacturedProduct>` case, not the nested `<part>`/`<partProduct>`
 structure some multi-part kits use — those get silently skipped rather than
-mis-parsed. Revisit if the yield looks low relative to a zip's XML count.
+mis-parsed. Revisit if the yield looks low relative to a zip's document count.
 
 ## Metadata (imprint / color / shape / score marks)
 
