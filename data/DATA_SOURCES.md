@@ -20,6 +20,35 @@ realistically hit 4-5 images/side; the long-tail thousands will often land at
 than assuming a uniform number — `eval/` reports accuracy split by this count
 so a thin class's low score isn't confused with a model bug.
 
+## DailyMed bulk SPL — the primary US RX+OTC image+metadata source
+
+Found after the original 5 Kaggle-hosted datasets turned out to have zero
+OTC-labeled images (ePillID and the VAIPE-based detection set are RX-only;
+the rest are unlabeled-by-drug). DailyMed's bulk Structured Product Labeling
+(SPL) releases, confirmed live at
+https://dailymed.nlm.nih.gov/dailymed/spl-resources-all-drug-labels.cfm,
+split into `dm_spl_release_human_rx_part{1,2}.zip` and
+`dm_spl_release_human_otc_part{1,2,3}.zip` — each SPL document is the actual
+FDA-submitted drug label XML, which for oral solid dosage forms includes
+`SPLCOLOR`/`SPLIMPRINT`/`SPLSHAPE`/`SPLSCORE`/`SPLSIZE` characteristics and a
+`SPLIMAGE` reference to a manufacturer-submitted product photo bundled in the
+same package. This is the only source in the whole pipeline that is US-only,
+covers OTC as well as RX, and has both real images and FDA-structured
+physical-characteristic data (no OCR guessing needed for these records).
+
+`scripts/parse_dailymed_spl.py` is a modernized (Python 3) port of the
+parsing logic in HHS's archived `pillbox-data-process` repo (the actual
+source of this imprint/color/shape/score extraction approach — a newer-
+looking alternative, `pharmaDB/dailymed_data_processor`, was checked and
+turned out to only handle label text/history, not images or physical
+characteristics, so it wasn't a useful base). It's unit-tested against a
+synthetic SPL XML fixture, not yet run against a real bulk zip.
+
+Known limitation: the parser only handles the common single-part
+`<manufacturedProduct>` case, not the nested `<part>`/`<partProduct>`
+structure some multi-part kits use — those get silently skipped rather than
+mis-parsed. Revisit if the yield looks low relative to a zip's XML count.
+
 ## Metadata (imprint / color / shape / score marks)
 
 RxNav's `ndcproperties` endpoint (already used in `pill-id/backend/scripts/build_ndc_names.py`)

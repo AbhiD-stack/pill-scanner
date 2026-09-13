@@ -34,9 +34,10 @@ CONFIDENCE_THRESHOLDS = [round(0.05 * i, 2) for i in range(1, 20)]  # 0.05 .. 0.
 class QueryRow:
     embedding: torch.Tensor
     true_label: str
-    domain: str  # "reference" | "consumer"
+    domain: str  # "reference" | "reference_pool" | "consumer"
     side: str  # "front" | "back" | "unknown"
     images_in_class: int  # how many reference images exist for true_label
+    category: str = "unknown"  # "RX" | "OTC" | "unknown"
 
 
 def _topk_hit(true_label: str, ranked_labels: list[str], k: int) -> bool:
@@ -100,6 +101,15 @@ def evaluate(rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: li
     for r in rows:
         by_domain[r.domain].append(r)
     report["by_domain"] = {d: _accuracy_block(rs, gallery_emb, gallery_labels) for d, rs in by_domain.items()}
+
+    # RX vs. OTC, reported separately for the same reason domain is: OTC has
+    # historically had ~zero coverage in this project, so blending it into
+    # one "overall" number would hide a regression or a persistently-thin
+    # OTC accuracy behind a healthy RX-dominated average.
+    by_category: dict[str, list[QueryRow]] = defaultdict(list)
+    for r in rows:
+        by_category[r.category].append(r)
+    report["by_category"] = {c: _accuracy_block(rs, gallery_emb, gallery_labels) for c, rs in by_category.items()}
 
     by_depth: dict[str, list[QueryRow]] = defaultdict(list)
     for r in rows:
@@ -168,6 +178,11 @@ def main() -> int:
     print("\nBy domain:")
     for domain, block in report["by_domain"].items():
         print(f"  {domain}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+    print("\nBy category (RX/OTC):")
+    for category, block in report["by_category"].items():
+        print(f"  {category}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+        if category == "OTC" and block.get("n", 0) == 0:
+            print("    ^ zero OTC queries in this eval run — OTC accuracy is unknown, not zero.")
 
     if args.min_top5_consumer is not None:
         consumer = report["by_domain"].get("consumer", {})
