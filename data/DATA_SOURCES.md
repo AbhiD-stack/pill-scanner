@@ -4,6 +4,19 @@ This repo's data acquisition runs in the Kaggle notebook (`notebooks/`), not in
 whatever environment is editing this code — image/metadata downloads need real
 internet access.
 
+**US-only policy**: every image source in this pipeline must be US-sourced.
+Three Kaggle datasets tried early on (OGYEIv2/Hungarian, a Philippines
+drugstore photo set, and an unconfirmed-origin drug/vitamin set) were removed
+once this was made explicit, even though they were real, per-class-labeled
+photos — being real and labeled isn't enough if the product/imprint/label
+conventions aren't US ones. Two more (a Vietnamese VAIPE-based pill-detection
+set and a couple of unconfirmed-origin ones) were dropped too even though
+they were only ever used as unlabeled bounding-box/detector-training data
+with no drug-identity claim attached — a stricter "no non-US imagery
+anywhere in the pipeline" bar, not just "no non-US drug labels." Current
+image sources are exactly three: ePillID, NIH C3PI, and DailyMed — all
+NIH/FDA-derived, all US.
+
 ## Images
 
 | Source | What it gives us | Images/side/class | Priority |
@@ -11,8 +24,12 @@ internet access.
 | ePillID (already have, in `pill-id`) | 4,902 RX classes, studio reference photos | 1 | baseline, carry forward |
 | NIH C3PI — reference tier | Broader RX imprint coverage than ePillID alone | 1-2 | fill RX class gaps |
 | NIH C3PI — consumer-quality tier | Phone/scanner photos, varied lighting/background | 3-10+ (uneven across NDCs) | closes the reference-vs-wild domain gap; prioritize for the top-500 RX tier first |
-| CURE dataset | Multi-condition photos (lighting/background/angle) built for this exact generalization problem | several per class | augment top-500+500 tier |
-| Kaggle-hosted mirrors of the above | Same content, faster to pull inside a Kaggle notebook than NIH directly | same as source | prefer over direct NIH scraping when available |
+| DailyMed bulk SPL (RX + OTC) | Manufacturer-submitted photos + FDA-structured imprint/color/shape/score, straight from the drug label | 1 per NDC typically | primary OTC source — see its own section below |
+
+CURE was never actually wired in (no confirmed Kaggle mirror was found), and
+a handful of other Kaggle-hosted datasets tried for extra volume were
+removed once the US-only policy was made explicit (see above) — don't
+re-add them without confirming US origin first.
 
 Expect uneven depth: the top-500 RX + top-500 OTC tier is where we can
 realistically hit 4-5 images/side; the long-tail thousands will often land at
