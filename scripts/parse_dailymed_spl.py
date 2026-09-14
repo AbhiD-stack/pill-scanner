@@ -75,6 +75,9 @@ def parse_spl_bytes(xml_bytes: bytes, rx_or_otc: str) -> list[SplPillRecord]:
     return _parse_root(root, rx_or_otc)
 
 
+PACKAGE_LABEL_SECTION_CODE = "51945-4"  # LOINC: "PACKAGE LABEL.PRINCIPAL DISPLAY PANEL"
+
+
 def _document_image_refs(root) -> list[str]:
     """Real DailyMed documents (confirmed against a live sample — the
     archived pillbox-data-process script's SPLIMAGE-characteristic approach
@@ -82,15 +85,27 @@ def _document_image_refs(root) -> list[str]:
     reference package-label photos via <observationMedia><value
     mediaType="image/..."><reference value="foo.jpg"/></value></observationMedia>
     blocks that live in a completely separate part of the document (package
-    label sections) from the manufacturedProduct/characteristic elements —
-    not nested under the product at all. These are typically package/box
-    photos, not always an isolated loose-pill shot.
+    label sections) from the manufacturedProduct/characteristic elements.
+
+    Restricted to <section> elements coded 51945-4 (PACKAGE LABEL.PRINCIPAL
+    DISPLAY PANEL) — confirmed necessary via a live full-scale run: RX
+    documents in particular embed many other observationMedia images
+    (chemical structure diagrams, dosing charts, medication-guide
+    illustrations) elsewhere in the document, which an unscoped `.//` search
+    also picks up — RX part1 alone produced ~4.4 images per pill record vs.
+    ~1.3-1.7 for OTC, a strong signal the unscoped version was pulling in
+    unrelated images. Even scoped to the package label panel, these remain
+    package/box photos, not always an isolated loose-pill shot.
     """
     refs = []
-    for om in root.iterfind(".//v3:observationMedia", NS):
-        ref = om.find("./v3:value/v3:reference", NS)
-        if ref is not None and ref.get("value"):
-            refs.append(ref.get("value"))
+    for section in root.iterfind(".//v3:section", NS):
+        code_el = section.find("./v3:code", NS)
+        if code_el is None or code_el.get("code") != PACKAGE_LABEL_SECTION_CODE:
+            continue
+        for om in section.iterfind(".//v3:observationMedia", NS):
+            ref = om.find("./v3:value/v3:reference", NS)
+            if ref is not None and ref.get("value"):
+                refs.append(ref.get("value"))
     return refs
 
 
