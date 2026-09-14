@@ -83,6 +83,17 @@ Known limitation: the parser only handles the common single-part
 structure some multi-part kits use — those get silently skipped rather than
 mis-parsed. Revisit if the yield looks low relative to a zip's document count.
 
+**Confirmed real result** (2026-09-14, scope: `human_otc_part1`,
+`human_otc_part2`, `human_rx_part1`): **133,348 manifest rows** — 6,728 OTC
+images, 126,620 RX images — across 4,757 unique pill records with metadata
+(2,588 + 2,169 OTC, 61,512 RX before per-image expansion). Images/record
+ratio: OTC ≈1.2-1.6, RX ≈2.1 (plausible — RX products commonly have more
+package-size NDC variants, each with its own package-label photo — not a
+sign of remaining contamination, which the 51945-4 section-scoping fix
+confirmed by cutting RX's image count roughly in half from an unscoped
+first attempt). 14 more parts (9 more OTC, 5 more RX) remain unfetched if
+more volume is wanted later.
+
 ## Metadata (imprint / color / shape / score marks)
 
 RxNav's `ndcproperties` endpoint (already used in `pill-id/backend/scripts/build_ndc_names.py`)
