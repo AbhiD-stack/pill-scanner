@@ -94,12 +94,34 @@ for key, root in dataset_roots.items():
 # Add Input > Notebook > c3pi_acquisition (after committing it via Save
 # Version > Save & Run All) to attach its c3pi_manifest.csv here.
 import glob as _glob_c3pi
+import zipfile as _zipfile_c3pi
 
-def find_c3pi_manifest():
-    candidates = _glob_c3pi.glob("/kaggle/input/**/c3pi_manifest.csv", recursive=True)
-    return candidates[0] if candidates else None
+def _find_or_unzip_manifest(filename, unzip_dir_name):
+    """Kaggle bundles a notebook's output into a single `_output_.zip`
+    instead of exposing files individually once there are too many output
+    files (confirmed: this is exactly what happened to the DailyMed
+    acquisition notebook's ~133k images — its manifest csv wasn't found
+    loose under /kaggle/input at all, only `_output_.zip` was). Try the
+    direct glob first, then fall back to finding and extracting any
+    `_output_.zip` under /kaggle/input and searching again."""
+    hits = _glob_c3pi.glob(f"/kaggle/input/**/{filename}", recursive=True)
+    if hits:
+        return hits[0]
+    zips = _glob_c3pi.glob("/kaggle/input/**/_output_.zip", recursive=True)
+    for zip_path in zips:
+        extract_dir = WORK_DIR / unzip_dir_name / Path(zip_path).parent.name
+        if not extract_dir.exists() or not any(extract_dir.iterdir()):
+            print(f"  extracting {zip_path} -> {extract_dir} (Kaggle zipped this "
+                  f"notebook's output because it had too many files)")
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with _zipfile_c3pi.ZipFile(zip_path) as zf:
+                zf.extractall(extract_dir)
+        hits = list(extract_dir.rglob(filename))
+        if hits:
+            return str(hits[0])
+    return None
 
-C3PI_MANIFEST_PATH = find_c3pi_manifest()
+C3PI_MANIFEST_PATH = _find_or_unzip_manifest("c3pi_manifest.csv", "c3pi_unzipped")
 if C3PI_MANIFEST_PATH:
     print(f"Found C3PI acquisition output at: {C3PI_MANIFEST_PATH}")
 else:
@@ -115,12 +137,33 @@ else:
 # ============================================================================
 
 import glob as _glob
+import zipfile as _zipfile_dm
 
-def find_dailymed_manifest():
-    candidates = _glob.glob("/kaggle/input/**/dailymed_manifest.csv", recursive=True)
-    return candidates[0] if candidates else None
+def _find_or_unzip_dailymed_manifest(filename, unzip_dir_name):
+    """Same Kaggle output-bundling behavior as C3PI's helper in Section 1.2 —
+    duplicated here (not shared) so each acquisition section stays
+    self-contained if pasted/run independently. Confirmed live: DailyMed's
+    ~133k-image output got bundled into `_output_.zip` rather than exposed
+    as individual files, so a direct glob for dailymed_manifest.csv alone
+    misses it entirely."""
+    hits = _glob.glob(f"/kaggle/input/**/{filename}", recursive=True)
+    if hits:
+        return hits[0]
+    zips = _glob.glob("/kaggle/input/**/_output_.zip", recursive=True)
+    for zip_path in zips:
+        extract_dir = WORK_DIR / unzip_dir_name / Path(zip_path).parent.name
+        if not extract_dir.exists() or not any(extract_dir.iterdir()):
+            print(f"  extracting {zip_path} -> {extract_dir} (Kaggle zipped this "
+                  f"notebook's output because it had too many files)")
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with _zipfile_dm.ZipFile(zip_path) as zf:
+                zf.extractall(extract_dir)
+        hits = list(extract_dir.rglob(filename))
+        if hits:
+            return str(hits[0])
+    return None
 
-DAILYMED_MANIFEST_PATH = find_dailymed_manifest()
+DAILYMED_MANIFEST_PATH = _find_or_unzip_dailymed_manifest("dailymed_manifest.csv", "dailymed_unzipped")
 if DAILYMED_MANIFEST_PATH:
     print(f"Found DailyMed acquisition output at: {DAILYMED_MANIFEST_PATH}")
     DAILYMED_METADATA_PATH = Path(DAILYMED_MANIFEST_PATH).parent / "dailymed_metadata.json"
