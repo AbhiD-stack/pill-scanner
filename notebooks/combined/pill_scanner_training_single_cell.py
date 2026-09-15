@@ -189,6 +189,19 @@ RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
 class RateLimited(Exception):
     pass
 
+def normalize_ndc9(ndc):
+    """5-4 digit labeler-product prefix (ignoring package size), same
+    zero-padding convention pill-id's build_ndc_names.py uses. Defined here
+    (rather than after the resolution loop, where it's also used to build
+    PRIORITY_NDC9_SET) so resolve_one can dedupe by it too -- package-size
+    variants of the same drug (e.g. "0069-2587-01" vs "0069-2587-30") share
+    an NDC9 prefix, so there's no point spending an HTTP call on more than
+    one of them."""
+    parts = str(ndc).split("-")
+    if len(parts) < 2:
+        return str(ndc)
+    return f"{parts[0].zfill(5)}-{parts[1].zfill(4)}"
+
 # Diagnostic counters — the previous version of this cell silently swallowed
 # every exception (network error, HTTP error, bad JSON, unexpected response
 # shape all looked identical: "0 NDC entries, no error shown"). A real run
@@ -297,6 +310,7 @@ def resolve_one(name):
             # NDCs -- we only need enough real NDC9 prefixes per name to
             # populate the priority tier, not every package size ever sold.
             targets = list(dict.fromkeys(concrete_rxcuis + [rxcui]))[:MAX_CONCRETE_RXCUIS_PER_NAME]
+            seen_ndc9 = set()
             for target_rxcui in targets:
                 try:
                     ndcs = ndcs_for_rxcui(target_rxcui)
@@ -304,7 +318,15 @@ def resolve_one(name):
                     continue
                 with _diag_lock:
                     _diag_names["ndc_hits" if ndcs else "ndc_misses"] += 1
-                for ndc in ndcs[:MAX_NDCS_PER_CONCRETE_RXCUI]:
+                fetched_for_this_rxcui = 0
+                for ndc in ndcs:
+                    prefix = normalize_ndc9(ndc)
+                    if prefix in seen_ndc9:
+                        continue  # same drug/strength, just a different package size
+                    if fetched_for_this_rxcui >= MAX_NDCS_PER_CONCRETE_RXCUI:
+                        break
+                    seen_ndc9.add(prefix)
+                    fetched_for_this_rxcui += 1
                     try:
                         props = properties_for_ndc(ndc)
                     except RateLimited:
@@ -365,16 +387,8 @@ if total_ndcs == 0:
               "check the /ndcs.json response shape against what ndcs_for_rxcui "
               "expects (ndcGroup.ndcList.ndc).")
 
-def normalize_ndc9(ndc):
-    """5-4 digit labeler-product prefix (ignoring package size), same
-    zero-padding convention pill-id's build_ndc_names.py uses — NDC padding
-    inconsistency between sources (RxNav vs. dataset-native strings) is a
-    well-known problem, this is the standard normalization for it."""
-    parts = str(ndc).split("-")
-    if len(parts) < 2:
-        return str(ndc)
-    return f"{parts[0].zfill(5)}-{parts[1].zfill(4)}"
-
+# normalize_ndc9 is defined earlier in this cell (next to RXNAV_BASE), so
+# resolve_one can also use it for early NDC9-based dedup.
 PRIORITY_NDC9_SET = {
     normalize_ndc9(entry["ndc"])
     for entries in drug_metadata.values()
