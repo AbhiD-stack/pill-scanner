@@ -38,6 +38,7 @@ class QueryRow:
     side: str  # "front" | "back" | "unknown"
     images_in_class: int  # how many reference images exist for true_label
     category: str = "unknown"  # "RX" | "OTC" | "unknown"
+    tier: str = "unknown"  # "priority" (top-500 RX/OTC) | "long_tail" | "unknown"
 
 
 def _topk_hit(true_label: str, ranked_labels: list[str], k: int) -> bool:
@@ -111,6 +112,14 @@ def evaluate(rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: li
         by_category[r.category].append(r)
     report["by_category"] = {c: _accuracy_block(rs, gallery_emb, gallery_labels) for c, rs in by_category.items()}
 
+    # The number that actually matters for the "doctors testing the top-500
+    # RX/OTC" goal — never blend this into the overall number, which is
+    # dominated by however many long-tail classes happen to be in the data.
+    by_tier: dict[str, list[QueryRow]] = defaultdict(list)
+    for r in rows:
+        by_tier[r.tier].append(r)
+    report["by_tier"] = {t: _accuracy_block(rs, gallery_emb, gallery_labels) for t, rs in by_tier.items()}
+
     by_depth: dict[str, list[QueryRow]] = defaultdict(list)
     for r in rows:
         bucket = "1-2" if r.images_in_class <= 2 else "3-5" if r.images_in_class <= 5 else "6+"
@@ -164,6 +173,14 @@ def main() -> int:
         "is below this bar — wire this into CI/notebook so a regression can't "
         "silently ship to the app.",
     )
+    ap.add_argument(
+        "--min-top5-priority",
+        type=float,
+        default=None,
+        help="If set, exit with a nonzero status when by_tier.priority.top5_acc "
+        "(the top-500 RX/OTC tier) is below this bar — this is the number that "
+        "actually matters for doctor testing, separate from the long tail.",
+    )
     args = ap.parse_args()
 
     rows = load_query_rows(args.query)
@@ -183,15 +200,30 @@ def main() -> int:
         print(f"  {category}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
         if category == "OTC" and block.get("n", 0) == 0:
             print("    ^ zero OTC queries in this eval run — OTC accuracy is unknown, not zero.")
+    print("\nBy tier (priority = top-500 RX/OTC — the number that actually matters for the doctor-testing goal):")
+    for tier, block in report["by_tier"].items():
+        print(f"  {tier}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
 
+    failed = False
     if args.min_top5_consumer is not None:
         consumer = report["by_domain"].get("consumer", {})
         acc = consumer.get("top5_acc")
         if acc is None or acc < args.min_top5_consumer:
-            print(f"\nGATE FAILED: consumer-domain top5 ({acc}) below bar ({args.min_top5_consumer}). "
-                  "Not exporting this model to the app.")
-            return 1
-        print(f"\nGATE PASSED: consumer-domain top5 ({acc}) meets bar ({args.min_top5_consumer}).")
+            print(f"\nGATE FAILED: consumer-domain top5 ({acc}) below bar ({args.min_top5_consumer}).")
+            failed = True
+        else:
+            print(f"\nGATE PASSED (consumer): top5 ({acc}) meets bar ({args.min_top5_consumer}).")
+    if args.min_top5_priority is not None:
+        priority = report["by_tier"].get("priority", {})
+        acc = priority.get("top5_acc")
+        if acc is None or acc < args.min_top5_priority:
+            print(f"GATE FAILED: priority-tier (top-500 RX/OTC) top5 ({acc}) below bar ({args.min_top5_priority}).")
+            failed = True
+        else:
+            print(f"GATE PASSED (priority tier): top5 ({acc}) meets bar ({args.min_top5_priority}).")
+    if failed:
+        print("\nNot exporting this model to the app.")
+        return 1
     return 0
 
 
