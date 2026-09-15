@@ -120,6 +120,16 @@ def evaluate(rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: li
         by_tier[r.tier].append(r)
     report["by_tier"] = {t: _accuracy_block(rs, gallery_emb, gallery_labels) for t, rs in by_tier.items()}
 
+    # The actual granular breakdown requested: "top-500 RX" and "top-500 OTC"
+    # as their own distinct numbers, not just tier and category reported
+    # separately (which can't tell you the priority-RX number on its own).
+    by_group: dict[str, list[QueryRow]] = defaultdict(list)
+    for r in rows:
+        by_group[f"{r.tier}_{r.category}"].append(r)
+    report["by_tier_and_category"] = {
+        g: _accuracy_block(rs, gallery_emb, gallery_labels) for g, rs in by_group.items()
+    }
+
     by_depth: dict[str, list[QueryRow]] = defaultdict(list)
     for r in rows:
         bucket = "1-2" if r.images_in_class <= 2 else "3-5" if r.images_in_class <= 5 else "6+"
@@ -203,6 +213,11 @@ def main() -> int:
     print("\nBy tier (priority = top-500 RX/OTC — the number that actually matters for the doctor-testing goal):")
     for tier, block in report["by_tier"].items():
         print(f"  {tier}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+    print("\nBy tier x category (the actual granular goal numbers — top-500 RX and top-500 OTC separately):")
+    for group, block in sorted(report["by_tier_and_category"].items()):
+        print(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+        if group == "priority_OTC" and block.get("n", 0) == 0:
+            print("    ^ zero priority-tier OTC queries — the top-500 OTC number is unknown, not zero.")
 
     failed = False
     if args.min_top5_consumer is not None:
