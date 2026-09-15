@@ -235,6 +235,28 @@ def ndcs_for_rxcui(rxcui):
     data = _get(f"{RXNAV_BASE}/rxcui/{rxcui}/ndcs.json", rxcui)
     return data.get("ndcGroup", {}).get("ndcList", {}).get("ndc", []) or []
 
+# Root cause of the "177 rxcuis resolved / 0 NDCs" bug: rxcui.json?search=2
+# on a bare generic name (e.g. "atorvastatin") resolves to RxNorm's
+# ingredient-level concept (TTY=IN), and /ndcs.json only returns NDCs for
+# concrete dispensable-drug concepts (SCD/SBD/GPCK/BPCK) -- an ingredient
+# concept has no NDCs directly attached, by design of the RxNorm concept
+# graph, not a bug in this code. Confirmed by the diagnostics: 377/377 HTTP
+# calls succeeded (ok=377, 0 errors of any kind), so this was never a
+# network/rate-limit issue -- it was querying the wrong concept level.
+CONCRETE_DRUG_TTYS = "SCD+SBD+GPCK+BPCK"
+MAX_CONCRETE_RXCUIS_PER_NAME = 25   # cap fan-out per ingredient name
+MAX_NDCS_PER_CONCRETE_RXCUI = 10    # cap package-size variants per concept
+
+def related_concrete_rxcuis(rxcui):
+    data = _get(f"{RXNAV_BASE}/rxcui/{rxcui}/related.json?tty={CONCRETE_DRUG_TTYS}", rxcui)
+    groups = data.get("relatedGroup", {}).get("conceptGroup", []) or []
+    out = []
+    for g in groups:
+        for cp in g.get("conceptProperties", []) or []:
+            if cp.get("rxcui"):
+                out.append(cp["rxcui"])
+    return out
+
 def properties_for_ndc(ndc):
     data = _get(f"{RXNAV_BASE}/ndcproperties.json?id={ndc}&ndcstatus=ALL", ndc)
     pl = data.get("ndcPropertyList", {}).get("ndcProperty", [])
@@ -258,19 +280,37 @@ def resolve_one(name):
         with _diag_lock:
             _diag_names["rxcui_hits" if rxcuis else "rxcui_misses"] += 1
         for rxcui in rxcuis:
+            # Expand each resolved rxcui to its concrete dispensable-drug
+            # relatives first -- an ingredient-level rxcui itself will
+            # always return an empty NDC list, so querying it directly (the
+            # old behavior) silently produced zero NDCs for every name.
             try:
-                ndcs = ndcs_for_rxcui(rxcui)
+                concrete_rxcuis = related_concrete_rxcuis(rxcui)
             except RateLimited:
-                continue
-            with _diag_lock:
-                _diag_names["ndc_hits" if ndcs else "ndc_misses"] += 1
-            for ndc in ndcs:
+                concrete_rxcuis = []
+            # Fall back to the original rxcui too, in case rxcui.json already
+            # resolved straight to a concrete concept for some names (brand
+            # names in particular sometimes do) -- cheap and harmless if
+            # ndcs_for_rxcui just returns [] for it.
+            # Bounded, not exhaustive: an ingredient can expand to dozens of
+            # strength/brand/generic concepts, each with many package-size
+            # NDCs -- we only need enough real NDC9 prefixes per name to
+            # populate the priority tier, not every package size ever sold.
+            targets = list(dict.fromkeys(concrete_rxcuis + [rxcui]))[:MAX_CONCRETE_RXCUIS_PER_NAME]
+            for target_rxcui in targets:
                 try:
-                    props = properties_for_ndc(ndc)
+                    ndcs = ndcs_for_rxcui(target_rxcui)
                 except RateLimited:
                     continue
-                if props:
-                    entries.append(props)
+                with _diag_lock:
+                    _diag_names["ndc_hits" if ndcs else "ndc_misses"] += 1
+                for ndc in ndcs[:MAX_NDCS_PER_CONCRETE_RXCUI]:
+                    try:
+                        props = properties_for_ndc(ndc)
+                    except RateLimited:
+                        continue
+                    if props:
+                        entries.append(props)
     except RateLimited:
         pass
     return name, entries
