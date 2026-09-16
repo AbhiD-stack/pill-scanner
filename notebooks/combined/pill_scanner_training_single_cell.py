@@ -968,23 +968,45 @@ PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
 @torch.no_grad()
-def _embed_for_quickval(rows, head):
+def _embed_for_quickval(rows, head, batch_size=64):
     """Skips (rather than crashes on) an unreadable image -- this exact
     function is what a real run crashed inside on a corrupt DailyMed file,
-    taking down 7 hours of training with no checkpoint saved."""
-    embs, lbls = [], []
+    taking down 7 hours of training with no checkpoint saved.
+
+    Batched (not one image at a time) -- confirmed live: an unbatched
+    version of this loop, combined with quick_val_top5's gallery covering
+    every train class, turned a "quick" validation into an ~80-90 MINUTE
+    stall every 200 steps (most of the 6h training budget going to
+    validation, not training). Batching alone doesn't fix the gallery-size
+    problem (see quick_val_top5), but it's still a real, honest speedup on
+    top of that fix."""
+    lbls = []
+    embs = []
     n_skipped = 0
+    buf_imgs, buf_lbls = [], []
+
+    def _flush():
+        if not buf_imgs:
+            return
+        pv = processor(images=buf_imgs, return_tensors="pt")["pixel_values"]
+        feat = extract_backbone_feature(pv)
+        emb = head(feat)["emb"]
+        embs.append(emb.cpu())
+        lbls.extend(buf_lbls)
+
     for r in rows:
         try:
             img = Image.open(r["path"]).convert("RGB")
         except Exception:
             n_skipped += 1
             continue
-        pv = processor(images=img, return_tensors="pt")["pixel_values"]
-        feat = extract_backbone_feature(pv)
-        emb = head(feat)["emb"]
-        embs.append(emb.cpu())
-        lbls.append(r["label"])
+        buf_imgs.append(img)
+        buf_lbls.append(r["label"])
+        if len(buf_imgs) >= batch_size:
+            _flush()
+            buf_imgs, buf_lbls = [], []
+    _flush()
+
     if n_skipped:
         print(f"_embed_for_quickval: skipped {n_skipped} unreadable image(s)")
     if not embs:
@@ -992,17 +1014,35 @@ def _embed_for_quickval(rows, head):
     return torch.cat(embs, dim=0), lbls
 
 @torch.no_grad()
-def quick_val_top5(head, train_rows, val_rows, gallery_per_class=2, sample_size=200):
+def quick_val_top5(head, train_rows, val_rows, gallery_per_class=2, sample_size=200,
+                    max_gallery_classes=400):
     """Cheap proxy top-5 (small capped gallery + a val sample, not the full
     eval/evaluate.py harness) — just for in-training checkpoint selection,
-    not a substitute for the real Section 10 gate on the full test set."""
+    not a substitute for the real Section 10 gate on the full test set.
+
+    max_gallery_classes actually caps it: with 63k+ train classes,
+    "2 images x every class" is up to ~127,000 images, not a small gallery
+    -- confirmed live, this (plus running unbatched) turned validation into
+    an 80+ minute stall every 200 steps, eating most of the training
+    budget. A random subset of classes is still a fair (if noisier) signal
+    for "is the head learning at all," which is all this proxy needs to be
+    for checkpoint selection -- the real per-class-complete numbers come
+    from the Section 10 gate on the full test set after training."""
     head.eval()
     from collections import defaultdict as _dd3
     by_label = _dd3(list)
     for r in train_rows:
         by_label[r["label"]].append(r)
-    gallery_rows = [r for rows in by_label.values() for r in rows[:gallery_per_class]]
-    query_rows = val_rows if len(val_rows) <= sample_size else _random.sample(val_rows, sample_size)
+    gallery_classes = list(by_label.keys())
+    if len(gallery_classes) > max_gallery_classes:
+        gallery_classes = _random.sample(gallery_classes, max_gallery_classes)
+    gallery_rows = [r for c in gallery_classes for r in by_label[c][:gallery_per_class]]
+    # Filter to gallery_classes BEFORE sampling, not after -- sampling 200
+    # random val rows first and filtering after would leave ~1 usable query
+    # on average (400/63604 train classes), making the proxy meaningless.
+    gallery_class_set = set(gallery_classes)
+    query_pool = [r for r in val_rows if r["label"] in gallery_class_set]
+    query_rows = query_pool if len(query_pool) <= sample_size else _random.sample(query_pool, sample_size)
     if not gallery_rows or not query_rows:
         head.train()
         return None
@@ -1148,19 +1188,40 @@ head, label_list = train_projection_head(train_rows, val_rows, CFG)
 # ============================================================================
 
 @torch.no_grad()
-def embed_rows(rows, head, label_list):
+def embed_rows(rows, head, label_list, batch_size=64):
     """label_list must be the model's canonical training label order (the
     list train_projection_head returned) — NOT re-derived from `rows` here,
     since that silently corrupted label_indices whenever `rows` didn't cover
     every training class in the same sorted order. Rows whose label isn't in
     label_list (e.g. a val/test singleton class never seen in training) are
     skipped and reported, not silently mis-indexed; returns the kept rows
-    alongside the embeddings so callers can zip them safely."""
+    alongside the embeddings so callers can zip them safely.
+
+    Batched -- this is called on the full train+val set (180k+ images) for
+    the deployment gallery export, and on the full test set for the
+    accuracy gate. An unbatched version of this exact pattern (one image at
+    a time through DINOv2-large) is what turned "quick" in-training
+    validation into an 80+ minute stall in a real run; run unbatched here,
+    on 180k+ images, it would cost hours post-training for no reason."""
     head.eval()
     label_to_idx = {l: i for i, l in enumerate(label_list)}
     embeddings, label_indices, abs_paths, kept_rows = [], [], [], []
     skipped = 0
     unreadable = 0
+    buf_imgs, buf_rows = [], []
+
+    def _flush():
+        if not buf_imgs:
+            return
+        pixel_values = processor(images=buf_imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
+        feat = extract_backbone_feature(pixel_values)
+        emb = head(feat.float())["emb"]
+        embeddings.append(emb.cpu())
+        for r in buf_rows:
+            label_indices.append(label_to_idx[r["label"]])
+            abs_paths.append(r["path"])
+            kept_rows.append(r)
+
     for row in rows:
         if row["label"] not in label_to_idx:
             skipped += 1
@@ -1170,13 +1231,13 @@ def embed_rows(rows, head, label_list):
         except Exception:
             unreadable += 1
             continue
-        pixel_values = processor(images=img, return_tensors="pt")["pixel_values"].to(DEVICE)
-        feat = extract_backbone_feature(pixel_values)
-        emb = head(feat.float())["emb"]
-        embeddings.append(emb.cpu())
-        label_indices.append(label_to_idx[row["label"]])
-        abs_paths.append(row["path"])
-        kept_rows.append(row)
+        buf_imgs.append(img)
+        buf_rows.append(row)
+        if len(buf_imgs) >= batch_size:
+            _flush()
+            buf_imgs, buf_rows = [], []
+    _flush()
+
     if skipped:
         print(f"embed_rows: skipped {skipped} rows with a label not in the model's training label_list")
     if unreadable:
