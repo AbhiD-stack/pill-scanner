@@ -458,27 +458,40 @@ def add_c3pi():
     see Section 1.2 — rather than scanning a raw C3PI_ROOT directory. That
     notebook already built the manifest (label/side/domain heuristic applied
     once, at acquisition time, and confirmed against the real rximage.zip
-    structure), so this just re-roots paths the same way add_dailymed() does."""
+    structure), so this just re-roots paths the same way add_dailymed() does.
+
+    PERFORMANCE: the acquisition notebook recorded absolute paths under its
+    own /kaggle/working, which don't exist once mounted here as a notebook
+    input -- so practically every row misses the direct-path check. A
+    previous version of this function fell back to `alt2.rglob(filename)`
+    PER ROW on a miss, i.e. a full directory-tree walk of the ~48k-file
+    extracted C3PI tree for each of ~48k rows. Confirmed live: this is what
+    silently ate 6+ hours of a run between "Resolved... NDC entries" and the
+    next printed line, with training not starting until deep into the
+    session and getting killed before a single checkpoint saved. Fixed by
+    building one filename->path index via a single os.walk, then doing O(1)
+    dict lookups per row instead."""
     if not C3PI_MANIFEST_PATH:
         return
     import csv as _csv3
+    import os as _os3
     manifest_dir = Path(C3PI_MANIFEST_PATH).parent
+    filename_index = {}
+    for search_root in (manifest_dir / "c3pi_images", manifest_dir / "rximage_extracted"):
+        if not search_root.exists():
+            continue
+        for dirpath, _dirnames, filenames in _os3.walk(search_root):
+            for fn in filenames:
+                filename_index.setdefault(fn, str(Path(dirpath) / fn))
     n_missing = 0
     with open(C3PI_MANIFEST_PATH) as f:
         for row in _csv3.DictReader(f):
             path = row["path"]
             if not Path(path).exists():
-                alt = manifest_dir / "c3pi_images" / Path(path).name
-                if alt.exists():
-                    path = str(alt)
-                else:
-                    alt2 = manifest_dir / "rximage_extracted"
-                    hits = list(alt2.rglob(Path(path).name)) if alt2.exists() else []
-                    if hits:
-                        path = str(hits[0])
-                    else:
-                        n_missing += 1
-                        continue
+                path = filename_index.get(Path(path).name)
+                if path is None:
+                    n_missing += 1
+                    continue
             manifest_rows.append({**row, "path": path})
     if n_missing:
         print(f"add_c3pi: {n_missing} manifest rows had no resolvable image file")
@@ -486,24 +499,32 @@ def add_c3pi():
 def add_dailymed():
     """Reads the separate dailymed_acquisition.ipynb notebook's output
     (dailymed_manifest.csv) rather than downloading live in this notebook —
-    see Section 1.3. This is the only source with real US-NDC OTC coverage."""
+    see Section 1.3. This is the only source with real US-NDC OTC coverage.
+
+    Same indexed re-rooting as add_c3pi() (one directory walk, then O(1)
+    dict lookups) rather than a single guessed sibling path per row -- more
+    robust if the real extracted layout doesn't put every image directly
+    under dailymed_images/, and avoids reintroducing a per-row filesystem
+    search like the one that stalled add_c3pi() for hours."""
     if not DAILYMED_MANIFEST_PATH:
         return
     import csv as _csv2
+    import os as _os2
     manifest_dir = Path(DAILYMED_MANIFEST_PATH).parent
+    filename_index = {}
+    for search_root in (manifest_dir / "dailymed_images", manifest_dir):
+        if not search_root.exists():
+            continue
+        for dirpath, _dirnames, filenames in _os2.walk(search_root):
+            for fn in filenames:
+                filename_index.setdefault(fn, str(Path(dirpath) / fn))
     n_missing = 0
     with open(DAILYMED_MANIFEST_PATH) as f:
         for row in _csv2.DictReader(f):
             path = row["path"]
             if not Path(path).exists():
-                # Absolute paths recorded during acquisition point at that
-                # notebook's own /kaggle/working, which won't exist here —
-                # re-root relative to wherever this manifest was actually
-                # found (its sibling dailymed_images/ directory).
-                alt = manifest_dir / "dailymed_images" / Path(path).name
-                if alt.exists():
-                    path = str(alt)
-                else:
+                path = filename_index.get(Path(path).name)
+                if path is None:
                     n_missing += 1
                     continue
             manifest_rows.append({**row, "path": path})
@@ -624,6 +645,33 @@ by_tier = Counter(r["tier"] for r in manifest_rows)
 print("By tier (priority/long_tail/unknown):", dict(by_tier))
 
 labeled_rows = [r for r in manifest_rows if r["label"]]
+
+# Validate every labeled image opens before committing hours of training to
+# it -- confirmed necessary via a live run: a single corrupt/unreadable
+# DailyMed image (UnidentifiedImageError) crashed a 7-HOUR run at the very
+# first checkpoint opportunity, with nothing saved. A bulk pipeline pulling
+# ~250k files from zips-of-zips will have some bad ones; filtering them out
+# up front (fast header-only check, not a full decode) means training can't
+# be brought down by one of them, and PillDataset/embed_rows/quick_val_top5
+# below also catch+skip per-item as a second line of defense.
+def _is_openable_image(path):
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+print(f"Validating {len(labeled_rows)} labeled image files before training...")
+with ThreadPoolExecutor(max_workers=32) as _pool:
+    _valid_flags = list(_pool.map(_is_openable_image, [r["path"] for r in labeled_rows]))
+_n_before_validation = len(labeled_rows)
+labeled_rows = [r for r, ok in zip(labeled_rows, _valid_flags) if ok]
+_n_corrupt = _n_before_validation - len(labeled_rows)
+if _n_corrupt:
+    print(f"Filtered out {_n_corrupt} unreadable/corrupt image files "
+          f"(of {_n_before_validation} labeled rows) before training")
+
 by_label_count = Counter(r["label"] for r in labeled_rows)
 print(f"Labeled images: {len(labeled_rows)} across {len(by_label_count)} distinct labels")
 depth_dist = Counter(by_label_count.values())
@@ -734,9 +782,22 @@ class PillDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retries_left=3):
         row = self.rows[idx]
-        img = Image.open(row["path"]).convert("RGB")
+        try:
+            img = Image.open(row["path"]).convert("RGB")
+        except Exception as e:
+            # Belt-and-suspenders: Section 3 already filters out files that
+            # fail Image.verify() before training starts, but a file can
+            # still fail full decode (verify() only checks the header) or
+            # go missing/truncated between that check and this read. A
+            # single bad file crashing __getitem__ mid-batch previously took
+            # down an entire 7-hour run with nothing saved -- resample a
+            # different random row instead of raising.
+            if _retries_left <= 0:
+                raise
+            print(f"PillDataset: skipping unreadable {row['path']} ({e}), resampling")
+            return self.__getitem__(random.randrange(len(self.rows)), _retries_left - 1)
         if self.training:
             img = augment_for_domain(img, row["domain"])
         pixel_values = self.processor(images=img, return_tensors="pt")["pixel_values"][0]
@@ -908,14 +969,26 @@ VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint se
 
 @torch.no_grad()
 def _embed_for_quickval(rows, head):
+    """Skips (rather than crashes on) an unreadable image -- this exact
+    function is what a real run crashed inside on a corrupt DailyMed file,
+    taking down 7 hours of training with no checkpoint saved."""
     embs, lbls = [], []
+    n_skipped = 0
     for r in rows:
-        img = Image.open(r["path"]).convert("RGB")
+        try:
+            img = Image.open(r["path"]).convert("RGB")
+        except Exception:
+            n_skipped += 1
+            continue
         pv = processor(images=img, return_tensors="pt")["pixel_values"]
         feat = extract_backbone_feature(pv)
         emb = head(feat)["emb"]
         embs.append(emb.cpu())
         lbls.append(r["label"])
+    if n_skipped:
+        print(f"_embed_for_quickval: skipped {n_skipped} unreadable image(s)")
+    if not embs:
+        return torch.empty(0), []
     return torch.cat(embs, dim=0), lbls
 
 @torch.no_grad()
@@ -936,6 +1009,9 @@ def quick_val_top5(head, train_rows, val_rows, gallery_per_class=2, sample_size=
 
     gal_emb, gal_lbls = _embed_for_quickval(gallery_rows, head)
     q_emb, q_lbls = _embed_for_quickval(query_rows, head)
+    if not gal_lbls or not q_lbls:
+        head.train()
+        return None
     gal_emb_n = F.normalize(gal_emb, dim=1)
     q_emb_n = F.normalize(q_emb, dim=1)
     sims = q_emb_n @ gal_emb_n.T
@@ -1084,11 +1160,16 @@ def embed_rows(rows, head, label_list):
     label_to_idx = {l: i for i, l in enumerate(label_list)}
     embeddings, label_indices, abs_paths, kept_rows = [], [], [], []
     skipped = 0
+    unreadable = 0
     for row in rows:
         if row["label"] not in label_to_idx:
             skipped += 1
             continue
-        img = Image.open(row["path"]).convert("RGB")
+        try:
+            img = Image.open(row["path"]).convert("RGB")
+        except Exception:
+            unreadable += 1
+            continue
         pixel_values = processor(images=img, return_tensors="pt")["pixel_values"].to(DEVICE)
         feat = extract_backbone_feature(pixel_values)
         emb = head(feat.float())["emb"]
@@ -1098,9 +1179,11 @@ def embed_rows(rows, head, label_list):
         kept_rows.append(row)
     if skipped:
         print(f"embed_rows: skipped {skipped} rows with a label not in the model's training label_list")
+    if unreadable:
+        print(f"embed_rows: skipped {unreadable} rows with an unreadable image file")
     return {
-        "embeddings": torch.cat(embeddings, dim=0),
-        "label_indices": torch.tensor(label_indices),
+        "embeddings": torch.cat(embeddings, dim=0) if embeddings else torch.empty(0),
+        "label_indices": torch.tensor(label_indices, dtype=torch.long),
         "abs_paths": abs_paths,
     }, kept_rows
 
