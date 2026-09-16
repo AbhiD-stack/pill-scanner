@@ -963,7 +963,14 @@ import random as _random
 # would make even one epoch's duration unpredictable. Widen these once a
 # real run has been timed.
 MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k images/epoch
-MAX_TRAIN_SECONDS = 6 * 3600  # 6h budget, leaving buffer inside a 9-12h GPU session
+# Confirmed live at ~3.7s/batch (2 GPUs, DataParallel) -> ~50min/epoch. Was
+# 6h; bumped to 7h now that the quick_val_top5 and C3PI-path-search bugs
+# (which used to burn most of a run's wall clock on validation/preprocessing
+# instead of training) are fixed -- with a ~13h Kaggle quota, ~30min
+# preprocessing, and export+gate now batched (not the multi-hour unbatched
+# cost from before), 7h training leaves real buffer for export/gate to
+# still complete and save artifacts even if that estimate is optimistic.
+MAX_TRAIN_SECONDS = 7 * 3600
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
@@ -986,13 +993,30 @@ def _embed_for_quickval(rows, head, batch_size=64):
     buf_imgs, buf_lbls = [], []
 
     def _flush():
+        nonlocal n_skipped
         if not buf_imgs:
             return
-        pv = processor(images=buf_imgs, return_tensors="pt")["pixel_values"]
-        feat = extract_backbone_feature(pv)
-        emb = head(feat)["emb"]
-        embs.append(emb.cpu())
-        lbls.extend(buf_lbls)
+        try:
+            pv = processor(images=buf_imgs, return_tensors="pt")["pixel_values"]
+            feat = extract_backbone_feature(pv)
+            emb = head(feat)["emb"]
+            embs.append(emb.cpu())
+            lbls.extend(buf_lbls)
+        except Exception as e:
+            # A whole-batch failure (e.g. one image with an unusual mode
+            # slipping past .convert("RGB")) shouldn't lose the rest of the
+            # batch -- retry one image at a time and skip only the actual
+            # offender(s).
+            print(f"_embed_for_quickval: batch of {len(buf_imgs)} failed ({e}), retrying individually")
+            for img, lbl in zip(buf_imgs, buf_lbls):
+                try:
+                    pv = processor(images=[img], return_tensors="pt")["pixel_values"]
+                    feat = extract_backbone_feature(pv)
+                    emb = head(feat)["emb"]
+                    embs.append(emb.cpu())
+                    lbls.append(lbl)
+                except Exception:
+                    n_skipped += 1
 
     for r in rows:
         try:
@@ -1179,7 +1203,36 @@ print(f"Max epochs configured: {CFG['proj_epochs']} | Wall-clock budget: {MAX_TR
       f"(whichever limit hits first stops training and moves to export/gate)", flush=True)
 print("=" * 60, flush=True)
 
-head, label_list = train_projection_head(train_rows, val_rows, CFG)
+try:
+    head, label_list = train_projection_head(train_rows, val_rows, CFG)
+except Exception as e:
+    # Last-resort fallback: if training itself crashes despite the
+    # resampling/skip logic already in PillDataset/quick_val_top5, don't
+    # lose the run -- load whichever checkpoint train_projection_head last
+    # wrote to disk (best_projection_head.pt if any quickval ever ran,
+    # otherwise latest_checkpoint.pt from the most recent completed epoch)
+    # and let export/gate still run against real trained weights instead
+    # of aborting the whole notebook with nothing usable.
+    import traceback as _tb2
+    print(f"train_projection_head CRASHED: {type(e).__name__}: {e}", flush=True)
+    print(_tb2.format_exc(), flush=True)
+    _fallback_ckpt = None
+    for _name in ("best_projection_head.pt", "latest_checkpoint.pt"):
+        _p = EXPORT_DIR / _name
+        if _p.exists():
+            _fallback_ckpt = _p
+            break
+    if _fallback_ckpt is None:
+        raise RuntimeError(
+            "Training crashed and no checkpoint was ever saved -- nothing "
+            "to fall back to. See the traceback above for the real cause."
+        ) from e
+    print(f"Falling back to {_fallback_ckpt} (from before the crash)", flush=True)
+    _ckpt = torch.load(_fallback_ckpt, map_location=DEVICE)
+    label_list = _ckpt["label_classes"]
+    head = ProjectionHead(in_dim=_ckpt["in_dim"], hidden_dim=CFG["proj_hidden_dim"],
+                           out_dim=CFG["proj_embedding_dim"], num_classes=_ckpt["num_classes"]).to(DEVICE)
+    head.load_state_dict(_ckpt["head_state_dict"])
 
 
 
@@ -1211,16 +1264,36 @@ def embed_rows(rows, head, label_list, batch_size=64):
     buf_imgs, buf_rows = [], []
 
     def _flush():
+        nonlocal unreadable
         if not buf_imgs:
             return
-        pixel_values = processor(images=buf_imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
-        feat = extract_backbone_feature(pixel_values)
-        emb = head(feat.float())["emb"]
-        embeddings.append(emb.cpu())
-        for r in buf_rows:
-            label_indices.append(label_to_idx[r["label"]])
-            abs_paths.append(r["path"])
-            kept_rows.append(r)
+        try:
+            pixel_values = processor(images=buf_imgs, return_tensors="pt")["pixel_values"].to(DEVICE)
+            feat = extract_backbone_feature(pixel_values)
+            emb = head(feat.float())["emb"]
+            embeddings.append(emb.cpu())
+            for r in buf_rows:
+                label_indices.append(label_to_idx[r["label"]])
+                abs_paths.append(r["path"])
+                kept_rows.append(r)
+        except Exception as e:
+            # Same reasoning as _embed_for_quickval: don't lose an entire
+            # 64-image batch (this function embeds the full deployment
+            # gallery and the gate's test set -- both too expensive to
+            # risk on one bad image) -- retry individually and skip only
+            # the actual offender(s).
+            print(f"embed_rows: batch of {len(buf_imgs)} failed ({e}), retrying individually")
+            for img, r in zip(buf_imgs, buf_rows):
+                try:
+                    pixel_values = processor(images=[img], return_tensors="pt")["pixel_values"].to(DEVICE)
+                    feat = extract_backbone_feature(pixel_values)
+                    emb = head(feat.float())["emb"]
+                    embeddings.append(emb.cpu())
+                    label_indices.append(label_to_idx[r["label"]])
+                    abs_paths.append(r["path"])
+                    kept_rows.append(r)
+                except Exception:
+                    unreadable += 1
 
     for row in rows:
         if row["label"] not in label_to_idx:
@@ -1250,6 +1323,10 @@ def embed_rows(rows, head, label_list, batch_size=64):
 
 
 def export_artifacts(head, label_list, gallery_rows):
+    """Returns the gallery embeddings it computed -- the Section 10 gate
+    needs the exact same train+val embeddings for its reference gallery,
+    and re-embedding 180k+ images a second time from scratch would double
+    an already-expensive pass for no reason."""
     torch.save({
         "head_state_dict": head.state_dict(),
         "cfg": CFG,
@@ -1261,8 +1338,9 @@ def export_artifacts(head, label_list, gallery_rows):
     gallery, _ = embed_rows(gallery_rows, head, label_list)
     torch.save(gallery, EXPORT_DIR / "deployed_ref_embeddings.pt")
     print(f"Exported artifacts to {EXPORT_DIR}")
+    return gallery
 
-export_artifacts(head, label_list, train_rows + val_rows)
+deployed_gallery = export_artifacts(head, label_list, train_rows + val_rows)
 
 
 
@@ -1292,32 +1370,60 @@ class QueryRow:
 def _topk_hit(true_label, ranked_labels, k):
     return true_label in ranked_labels[:k]
 
-def _rank_query(query_emb, gallery_emb, gallery_labels):
-    sims = F.normalize(query_emb, dim=0) @ F.normalize(gallery_emb, dim=1).T
-    order = torch.argsort(sims, descending=True)
-    seen = set()
-    ranked = []
-    for idx in order.tolist():
-        lbl = gallery_labels[idx]
-        if lbl not in seen:
-            seen.add(lbl)
-            ranked.append(lbl)
-    return ranked, sims
+def _rank_chunk(query_emb_n, gallery_emb_n, gallery_labels):
+    """Ranks a whole chunk of queries against the gallery in one batched
+    matmul. Chunked (not the whole query set at once) to keep memory
+    bounded against a 180k+-image gallery -- a single (n_queries x
+    gallery_size) similarity matrix at that scale would be tens of GB."""
+    sims_chunk = query_emb_n @ gallery_emb_n.T
+    order_chunk = torch.argsort(sims_chunk, dim=1, descending=True)
+    top1_chunk = sims_chunk.max(dim=1).values
+    out = []
+    for i in range(order_chunk.shape[0]):
+        seen = set()
+        ranked = []
+        for idx in order_chunk[i].tolist():
+            lbl = gallery_labels[idx]
+            if lbl not in seen:
+                seen.add(lbl)
+                ranked.append(lbl)
+        out.append((ranked, float(top1_chunk[i])))
+    return out
 
-def _accuracy_block(rows, gallery_emb, gallery_labels):
+def _rank_all_rows(rows, gallery_emb, gallery_labels, chunk_size=256):
+    """Ranks every row exactly once, normalizing the gallery exactly once --
+    the naive per-axis approach (overall/domain/category/tier/
+    tier_and_category/images_per_class/worst_classes = 7 axes) used to
+    recompute this from scratch per axis, i.e. re-normalize the entire
+    ~180k-image gallery up to 7x PER TEST ROW. At tens of thousands of test
+    rows that's billions of wasted floating-point ops -- confirmed to
+    matter at this project's actual scale, not a micro-optimization."""
+    if not rows:
+        return []
+    gallery_emb_n = F.normalize(gallery_emb, dim=1)
+    query_emb_n = F.normalize(torch.stack([r.embedding for r in rows]), dim=1)
+    precomputed = []
+    for start in range(0, len(rows), chunk_size):
+        chunk_result = _rank_chunk(query_emb_n[start:start + chunk_size], gallery_emb_n, gallery_labels)
+        for local_i, (ranked, top1_score) in enumerate(chunk_result):
+            row = rows[start + local_i]
+            correct = bool(ranked and ranked[0] == row.true_label)
+            precomputed.append((ranked, top1_score, correct))
+    return precomputed
+
+def _accuracy_block(rows, rankings):
     hits = {k: 0 for k in TOPKS}
     top1_scores, correct_at_top1 = [], []
     n = 0
-    for row in rows:
-        ranked, sims = _rank_query(row.embedding, gallery_emb, gallery_labels)
+    for row, (ranked, top1_score, correct) in zip(rows, rankings):
         if not ranked:
             continue
         n += 1
         for k in TOPKS:
             if _topk_hit(row.true_label, ranked, k):
                 hits[k] += 1
-        top1_scores.append(float(sims.max()))
-        correct_at_top1.append(ranked[0] == row.true_label)
+        top1_scores.append(top1_score)
+        correct_at_top1.append(correct)
     if n == 0:
         return {"n": 0}
     result = {"n": n, **{f"top{k}_acc": hits[k] / n for k in TOPKS}}
@@ -1332,34 +1438,38 @@ def _accuracy_block(rows, gallery_emb, gallery_labels):
 
 def evaluate(rows, gallery_emb, gallery_labels):
     report = {}
-    report["overall"] = _accuracy_block(rows, gallery_emb, gallery_labels)
+    rankings = _rank_all_rows(rows, gallery_emb, gallery_labels)
+
+    def _block_for(indices):
+        return _accuracy_block([rows[i] for i in indices], [rankings[i] for i in indices])
+
+    report["overall"] = _block_for(list(range(len(rows))))
     by_domain = _defaultdict(list)
-    for r in rows:
-        by_domain[r.domain].append(r)
-    report["by_domain"] = {d: _accuracy_block(rs, gallery_emb, gallery_labels) for d, rs in by_domain.items()}
+    for i, r in enumerate(rows):
+        by_domain[r.domain].append(i)
+    report["by_domain"] = {d: _block_for(idxs) for d, idxs in by_domain.items()}
     by_category = _defaultdict(list)
-    for r in rows:
-        by_category[r.category].append(r)
-    report["by_category"] = {c: _accuracy_block(rs, gallery_emb, gallery_labels) for c, rs in by_category.items()}
+    for i, r in enumerate(rows):
+        by_category[r.category].append(i)
+    report["by_category"] = {c: _block_for(idxs) for c, idxs in by_category.items()}
     by_tier = _defaultdict(list)
-    for r in rows:
-        by_tier[r.tier].append(r)
-    report["by_tier"] = {t: _accuracy_block(rs, gallery_emb, gallery_labels) for t, rs in by_tier.items()}
+    for i, r in enumerate(rows):
+        by_tier[r.tier].append(i)
+    report["by_tier"] = {t: _block_for(idxs) for t, idxs in by_tier.items()}
     # The actual granular goal numbers: top-500 RX and top-500 OTC as their
     # own distinct accuracies, not just tier and category reported separately.
     by_group = _defaultdict(list)
-    for r in rows:
-        by_group[f"{r.tier}_{r.category}"].append(r)
-    report["by_tier_and_category"] = {g: _accuracy_block(rs, gallery_emb, gallery_labels) for g, rs in by_group.items()}
+    for i, r in enumerate(rows):
+        by_group[f"{r.tier}_{r.category}"].append(i)
+    report["by_tier_and_category"] = {g: _block_for(idxs) for g, idxs in by_group.items()}
     by_depth = _defaultdict(list)
-    for r in rows:
+    for i, r in enumerate(rows):
         bucket = "1-2" if r.images_in_class <= 2 else "3-5" if r.images_in_class <= 5 else "6+"
-        by_depth[bucket].append(r)
-    report["by_images_per_class"] = {b: _accuracy_block(rs, gallery_emb, gallery_labels) for b, rs in by_depth.items()}
+        by_depth[bucket].append(i)
+    report["by_images_per_class"] = {b: _block_for(idxs) for b, idxs in by_depth.items()}
     per_class = _defaultdict(list)
-    for r in rows:
-        ranked, _ = _rank_query(r.embedding, gallery_emb, gallery_labels)
-        per_class[r.true_label].append(_topk_hit(r.true_label, ranked, 5))
+    for row, (ranked, _, _) in zip(rows, rankings):
+        per_class[row.true_label].append(_topk_hit(row.true_label, ranked, 5))
     worst = sorted(
         ((label, sum(hits) / len(hits), len(hits)) for label, hits in per_class.items()),
         key=lambda x: x[1],
@@ -1371,30 +1481,74 @@ def evaluate(rows, gallery_emb, gallery_labels):
 
 MIN_TOP5_CONSUMER = 0.70  # tune this to what you actually need before shipping
 
-if evaluate is not None:
-    gallery, _ = embed_rows(train_rows + val_rows, head, label_list)
-    test_embedded, test_kept_rows = embed_rows(test_rows, head, label_list)
-    query_rows = [
-        QueryRow(embedding=emb, true_label=r["label"], domain=r["domain"],
-                 side=r["side"], images_in_class=by_label_count[r["label"]],
-                 category=r["category"], tier=r.get("tier", "unknown"))
-        for r, emb in zip(test_kept_rows, test_embedded["embeddings"])
-    ]
-    report = evaluate(query_rows, gallery["embeddings"], [label_list[i] for i in gallery["label_indices"].tolist()])
-    json.dump(report, open(EXPORT_DIR / "eval_report.json", "w"), indent=2, default=str)
-    consumer_top5 = report["by_domain"].get("consumer", {}).get("top5_acc")
-    otc_top5 = report["by_category"].get("OTC", {}).get("top5_acc")
-    priority_top5 = report["by_tier"].get("priority", {}).get("top5_acc")
-    priority_top10 = report["by_tier"].get("priority", {}).get("top10_acc")
-    print("consumer-domain top5:", consumer_top5, "| OTC-category top5:", otc_top5)
-    print("PRIORITY TIER (top-500 RX/OTC — the actual doctor-testing goal): "
-          f"top5={priority_top5} top10={priority_top10}")
-    print("By the 500 most common drugs, RX and OTC separately (the real goal numbers):")
-    for group, block in sorted(report["by_tier_and_category"].items()):
-        print(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
-    if consumer_top5 is not None and consumer_top5 >= MIN_TOP5_CONSUMER:
-        (EXPORT_DIR / "APPROVED_FOR_DEPLOY").write_text(f"consumer_top5={consumer_top5} otc_top5={otc_top5}")
-        print("GATE PASSED — artifacts in", EXPORT_DIR, "are approved to copy into pill-scanner/backend.")
+# Everything below is wrapped so that ANY unexpected failure here (the gate
+# is the most complex remaining code path: it touches every row's
+# category/tier/domain and the full similarity ranking) still leaves a
+# RUN_SUMMARY.txt behind explaining what happened -- the model weights and
+# gallery are already safely on disk from Section 9's export_artifacts
+# BEFORE this cell runs, so a gate-only failure should never look like the
+# whole run produced nothing.
+_summary_lines = []
+def _log(line):
+    print(line, flush=True)
+    _summary_lines.append(line)
+
+_summary_lines.append("PILL SCANNER RUN SUMMARY")
+_summary_lines.append("=" * 60)
+_summary_lines.append(f"Total images in manifest: {len(manifest_rows)}")
+_summary_lines.append(f"Labeled images (post-validation): {len(labeled_rows)}")
+_summary_lines.append(f"By source: {dict(by_source)}")
+_summary_lines.append(f"By category: {dict(by_cat)}")
+_summary_lines.append(f"By tier: {dict(by_tier)}")
+_summary_lines.append(f"Priority-tier NDC9 prefixes resolved: {len(PRIORITY_NDC9_SET)}")
+_summary_lines.append(f"Train/val/test rows: {len(train_rows)}/{len(val_rows)}/{len(test_rows)}")
+_summary_lines.append(f"Distinct classes: {len(label_list)}")
+_summary_lines.append("")
+
+try:
+    if evaluate is None:
+        _log("Gate skipped: evaluate() unavailable (should not happen -- inlined in this cell).")
     else:
-        print("GATE FAILED — do not deploy this model. Get more consumer-domain data or train longer.")
+        # Reuse the gallery export_artifacts already computed (Section 9) --
+        # same train+val rows, same head, same label_list, so re-embedding
+        # them here would just be a second multi-hour pass over the same
+        # 180k+ images for an identical result.
+        gallery = deployed_gallery
+        test_embedded, test_kept_rows = embed_rows(test_rows, head, label_list)
+        query_rows = [
+            QueryRow(embedding=emb, true_label=r["label"], domain=r["domain"],
+                     side=r["side"], images_in_class=by_label_count[r["label"]],
+                     category=r["category"], tier=r.get("tier", "unknown"))
+            for r, emb in zip(test_kept_rows, test_embedded["embeddings"])
+        ]
+        report = evaluate(query_rows, gallery["embeddings"], [label_list[i] for i in gallery["label_indices"].tolist()])
+        json.dump(report, open(EXPORT_DIR / "eval_report.json", "w"), indent=2, default=str)
+        consumer_top5 = report["by_domain"].get("consumer", {}).get("top5_acc")
+        otc_top5 = report["by_category"].get("OTC", {}).get("top5_acc")
+        priority_top5 = report["by_tier"].get("priority", {}).get("top5_acc")
+        priority_top10 = report["by_tier"].get("priority", {}).get("top10_acc")
+        _log(f"OVERALL: n={report['overall'].get('n')} top1={report['overall'].get('top1_acc')} "
+             f"top5={report['overall'].get('top5_acc')} top10={report['overall'].get('top10_acc')}")
+        _log(f"consumer-domain top5: {consumer_top5} | OTC-category top5: {otc_top5}")
+        _log(f"PRIORITY TIER (top-500 RX/OTC -- the actual doctor-testing goal): "
+             f"top5={priority_top5} top10={priority_top10}")
+        _log("By the 500 most common drugs, RX and OTC separately (the real goal numbers):")
+        for group, block in sorted(report["by_tier_and_category"].items()):
+            _log(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+        _log("Worst 10 classes by top5 accuracy:")
+        for w in report["worst_classes_top5"][:10]:
+            _log(f"  {w['label']}: top5={w['top5_acc']} (n={w['n_queries']})")
+        if consumer_top5 is not None and consumer_top5 >= MIN_TOP5_CONSUMER:
+            (EXPORT_DIR / "APPROVED_FOR_DEPLOY").write_text(f"consumer_top5={consumer_top5} otc_top5={otc_top5}")
+            _log(f"GATE PASSED -- artifacts in {EXPORT_DIR} are approved to copy into pill-scanner/backend.")
+        else:
+            _log("GATE FAILED -- do not deploy this model. Get more consumer-domain data or train longer.")
+except Exception as e:
+    import traceback as _tb
+    _log(f"GATE CRASHED: {type(e).__name__}: {e}")
+    _log("Full traceback (model weights + gallery from Section 9 are still saved on disk regardless):")
+    _log(_tb.format_exc())
+
+(EXPORT_DIR / "RUN_SUMMARY.txt").write_text("\n".join(_summary_lines))
+print(f"\nWrote {EXPORT_DIR / 'RUN_SUMMARY.txt'} -- read this first if anything looks wrong.")
 

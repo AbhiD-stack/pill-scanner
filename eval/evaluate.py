@@ -45,36 +45,73 @@ def _topk_hit(true_label: str, ranked_labels: list[str], k: int) -> bool:
     return true_label in ranked_labels[:k]
 
 
-def _rank_query(
-    query_emb: torch.Tensor, gallery_emb: torch.Tensor, gallery_labels: list[str]
-) -> tuple[list[str], torch.Tensor]:
-    sims = F.normalize(query_emb, dim=0) @ F.normalize(gallery_emb, dim=1).T
-    order = torch.argsort(sims, descending=True)
-    seen = set()
-    ranked: list[str] = []
-    for idx in order.tolist():
-        lbl = gallery_labels[idx]
-        if lbl not in seen:
-            seen.add(lbl)
-            ranked.append(lbl)
-    return ranked, sims
+def _rank_chunk(
+    query_emb_n: torch.Tensor, gallery_emb_n: torch.Tensor, gallery_labels: list[str]
+) -> list[tuple[list[str], float]]:
+    """Ranks a whole chunk of (already-normalized) query embeddings against
+    the (already-normalized) gallery in one batched matmul, returning
+    (deduped ranked labels, top1 score) per row. Kept chunked rather than
+    doing the whole query set in one matmul — with a 180k+-image gallery, a
+    single (n_queries x gallery_size) similarity matrix would be tens of GB;
+    a few hundred rows at a time keeps memory bounded."""
+    sims_chunk = query_emb_n @ gallery_emb_n.T
+    order_chunk = torch.argsort(sims_chunk, dim=1, descending=True)
+    top1_chunk = sims_chunk.max(dim=1).values
+    out = []
+    for i in range(order_chunk.shape[0]):
+        seen = set()
+        ranked: list[str] = []
+        for idx in order_chunk[i].tolist():
+            lbl = gallery_labels[idx]
+            if lbl not in seen:
+                seen.add(lbl)
+                ranked.append(lbl)
+        out.append((ranked, float(top1_chunk[i])))
+    return out
 
 
-def _accuracy_block(rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: list[str]) -> dict:
+def _rank_all_rows(
+    rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: list[str], chunk_size: int = 256
+) -> list[tuple[list[str], float, bool]]:
+    """Ranks every row exactly once (normalizing the gallery exactly once),
+    instead of the naive approach of calling a per-row rank function once
+    per report axis (overall/domain/category/tier/tier_and_category/
+    images_per_class/worst_classes = 7x) -- each of which used to
+    re-normalize the *entire* gallery from scratch. Confirmed via a live run
+    to matter a lot at this scale: a ~180k-image gallery normalized ~7x per
+    test row, for tens of thousands of test rows, is billions of wasted
+    floating-point ops. Returns (ranked_labels, top1_score, top1_correct)
+    per row, reused by every axis below."""
+    if not rows:
+        return []
+    gallery_emb_n = F.normalize(gallery_emb, dim=1)
+    query_emb_n = F.normalize(torch.stack([r.embedding for r in rows]), dim=1)
+    precomputed: list[tuple[list[str], float, bool]] = []
+    for start in range(0, len(rows), chunk_size):
+        chunk_result = _rank_chunk(query_emb_n[start:start + chunk_size], gallery_emb_n, gallery_labels)
+        for local_i, (ranked, top1_score) in enumerate(chunk_result):
+            row = rows[start + local_i]
+            correct = bool(ranked and ranked[0] == row.true_label)
+            precomputed.append((ranked, top1_score, correct))
+    return precomputed
+
+
+def _accuracy_block(rows: list[QueryRow], rankings: list[tuple[list[str], float, bool]]) -> dict:
+    """rankings must be the precomputed (ranked_labels, top1_score, correct)
+    tuples for these exact rows, in the same order (see _rank_all_rows)."""
     hits = {k: 0 for k in TOPKS}
     top1_scores: list[float] = []
     correct_at_top1: list[bool] = []
     n = 0
-    for row in rows:
-        ranked, sims = _rank_query(row.embedding, gallery_emb, gallery_labels)
+    for row, (ranked, top1_score, correct) in zip(rows, rankings):
         if not ranked:
             continue
         n += 1
         for k in TOPKS:
             if _topk_hit(row.true_label, ranked, k):
                 hits[k] += 1
-        top1_scores.append(float(sims.max()))
-        correct_at_top1.append(ranked[0] == row.true_label)
+        top1_scores.append(top1_score)
+        correct_at_top1.append(correct)
 
     if n == 0:
         return {"n": 0}
@@ -96,52 +133,56 @@ def _accuracy_block(rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_lab
 def evaluate(rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: list[str]) -> dict:
     report: dict = {}
 
-    report["overall"] = _accuracy_block(rows, gallery_emb, gallery_labels)
+    # Rank every row exactly once, up front; every split below is just a
+    # different partition of the same (rows, rankings) pairs.
+    rankings = _rank_all_rows(rows, gallery_emb, gallery_labels)
 
-    by_domain: dict[str, list[QueryRow]] = defaultdict(list)
-    for r in rows:
-        by_domain[r.domain].append(r)
-    report["by_domain"] = {d: _accuracy_block(rs, gallery_emb, gallery_labels) for d, rs in by_domain.items()}
+    def _block_for(indices: list[int]) -> dict:
+        return _accuracy_block([rows[i] for i in indices], [rankings[i] for i in indices])
+
+    report["overall"] = _block_for(list(range(len(rows))))
+
+    by_domain: dict[str, list[int]] = defaultdict(list)
+    for i, r in enumerate(rows):
+        by_domain[r.domain].append(i)
+    report["by_domain"] = {d: _block_for(idxs) for d, idxs in by_domain.items()}
 
     # RX vs. OTC, reported separately for the same reason domain is: OTC has
     # historically had ~zero coverage in this project, so blending it into
     # one "overall" number would hide a regression or a persistently-thin
     # OTC accuracy behind a healthy RX-dominated average.
-    by_category: dict[str, list[QueryRow]] = defaultdict(list)
-    for r in rows:
-        by_category[r.category].append(r)
-    report["by_category"] = {c: _accuracy_block(rs, gallery_emb, gallery_labels) for c, rs in by_category.items()}
+    by_category: dict[str, list[int]] = defaultdict(list)
+    for i, r in enumerate(rows):
+        by_category[r.category].append(i)
+    report["by_category"] = {c: _block_for(idxs) for c, idxs in by_category.items()}
 
     # The number that actually matters for the "doctors testing the top-500
     # RX/OTC" goal — never blend this into the overall number, which is
     # dominated by however many long-tail classes happen to be in the data.
-    by_tier: dict[str, list[QueryRow]] = defaultdict(list)
-    for r in rows:
-        by_tier[r.tier].append(r)
-    report["by_tier"] = {t: _accuracy_block(rs, gallery_emb, gallery_labels) for t, rs in by_tier.items()}
+    by_tier: dict[str, list[int]] = defaultdict(list)
+    for i, r in enumerate(rows):
+        by_tier[r.tier].append(i)
+    report["by_tier"] = {t: _block_for(idxs) for t, idxs in by_tier.items()}
 
     # The actual granular breakdown requested: "top-500 RX" and "top-500 OTC"
     # as their own distinct numbers, not just tier and category reported
     # separately (which can't tell you the priority-RX number on its own).
-    by_group: dict[str, list[QueryRow]] = defaultdict(list)
-    for r in rows:
-        by_group[f"{r.tier}_{r.category}"].append(r)
-    report["by_tier_and_category"] = {
-        g: _accuracy_block(rs, gallery_emb, gallery_labels) for g, rs in by_group.items()
-    }
+    by_group: dict[str, list[int]] = defaultdict(list)
+    for i, r in enumerate(rows):
+        by_group[f"{r.tier}_{r.category}"].append(i)
+    report["by_tier_and_category"] = {g: _block_for(idxs) for g, idxs in by_group.items()}
 
-    by_depth: dict[str, list[QueryRow]] = defaultdict(list)
-    for r in rows:
+    by_depth: dict[str, list[int]] = defaultdict(list)
+    for i, r in enumerate(rows):
         bucket = "1-2" if r.images_in_class <= 2 else "3-5" if r.images_in_class <= 5 else "6+"
-        by_depth[bucket].append(r)
-    report["by_images_per_class"] = {b: _accuracy_block(rs, gallery_emb, gallery_labels) for b, rs in by_depth.items()}
+        by_depth[bucket].append(i)
+    report["by_images_per_class"] = {b: _block_for(idxs) for b, idxs in by_depth.items()}
 
     # Per-class worst performers (top-5 miss), so data-collection effort goes
     # to the classes that actually need it instead of guessing.
     per_class: dict[str, list[bool]] = defaultdict(list)
-    for r in rows:
-        ranked, _ = _rank_query(r.embedding, gallery_emb, gallery_labels)
-        per_class[r.true_label].append(_topk_hit(r.true_label, ranked, 5))
+    for row, (ranked, _, _) in zip(rows, rankings):
+        per_class[row.true_label].append(_topk_hit(row.true_label, ranked, 5))
     worst = sorted(
         ((label, sum(hits) / len(hits), len(hits)) for label, hits in per_class.items()),
         key=lambda x: x[1],
