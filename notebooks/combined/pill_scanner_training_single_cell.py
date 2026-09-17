@@ -418,6 +418,27 @@ PRIORITY_NDC9_SET = {
 }
 print(f"Priority tier: {len(PRIORITY_NDC9_SET)} distinct NDC9 prefixes across the seed lists")
 
+# seed_names above is literally top_500_seed.csv's 150 RX names followed by
+# top_otc_seed.csv's 49 OTC names, concatenated (confirmed: seed_names ==
+# rx_names + otc_names) -- split at that same boundary to build an
+# OTC-specific NDC9 set. This exists specifically to fix C3PI/RxIMAGE's
+# category tagging: c3pi_acquisition.ipynb hardcodes every row's category
+# as "RX" (a real assumption about C3PI's RX-only scope, not verified
+# against the actual downloaded data) -- if any of the 48,312 already-
+# downloaded C3PI images actually correspond to one of the 49 OTC seed
+# drugs, add_c3pi() below re-tags those specific rows as OTC using this
+# set, recovering real OTC coverage from data already on disk instead of
+# needing a new download.
+OTC_SEED_NAMES = seed_names[150:]
+OTC_NDC9_SET = {
+    normalize_ndc9(entry["ndc"])
+    for name in OTC_SEED_NAMES
+    for entry in drug_metadata.get(name, [])
+    if entry.get("ndc")
+}
+print(f"OTC-specific tier: {len(OTC_NDC9_SET)} distinct NDC9 prefixes from the 49 OTC seed drugs "
+      f"(used to fix C3PI's hardcoded RX category tag where it's wrong)")
+
 
 
 # ============================================================================
@@ -505,6 +526,7 @@ def add_c3pi():
             for fn in filenames:
                 filename_index.setdefault(fn, str(Path(dirpath) / fn))
     n_missing = 0
+    n_recovered_otc = 0
     with open(C3PI_MANIFEST_PATH) as f:
         for row in _csv3.DictReader(f):
             path = row["path"]
@@ -513,9 +535,24 @@ def add_c3pi():
                 if path is None:
                     n_missing += 1
                     continue
-            manifest_rows.append({**row, "path": path})
+            row = {**row, "path": path}
+            # c3pi_acquisition.ipynb hardcodes category="RX" for every row
+            # (an assumption about C3PI's scope, not something verified
+            # against the actual data). If this row's NDC matches one of
+            # the 49 OTC seed drugs, it really is OTC -- recover that
+            # instead of training/evaluating it as a mislabeled RX row.
+            if row.get("label") and normalize_ndc9(row["label"]) in OTC_NDC9_SET:
+                row["category"] = "OTC"
+                n_recovered_otc += 1
+            manifest_rows.append(row)
     if n_missing:
         print(f"add_c3pi: {n_missing} manifest rows had no resolvable image file")
+    if n_recovered_otc:
+        print(f"add_c3pi: recovered {n_recovered_otc} rows as OTC (were hardcoded RX by "
+              f"the acquisition notebook, but their NDC matches a known OTC seed drug)")
+    else:
+        print("add_c3pi: 0 rows matched a known OTC seed drug -- this C3PI reference set "
+              "really does appear to be RX-only, not a bug in the category tag")
 
 def add_dailymed():
     """Reads the separate dailymed_acquisition.ipynb notebook's output
