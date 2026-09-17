@@ -196,11 +196,32 @@ def normalize_ndc9(ndc):
     PRIORITY_NDC9_SET) so resolve_one can dedupe by it too -- package-size
     variants of the same drug (e.g. "0069-2587-01" vs "0069-2587-30") share
     an NDC9 prefix, so there's no point spending an HTTP call on more than
-    one of them."""
-    parts = str(ndc).split("-")
-    if len(parts) < 2:
-        return str(ndc)
-    return f"{parts[0].zfill(5)}-{parts[1].zfill(4)}"
+    one of them.
+
+    Handles BOTH hyphenated NDCs (as dataset labels use, e.g. epillid's
+    "60429-187" or DailyMed's "49884-307-02") AND RxNav's own format --
+    confirmed live: RxNav's /ndcs.json returns NDCs as concatenated 11-digit
+    strings with NO hyphens (e.g. "00069258930"). The old version's
+    `str(ndc).split("-")` on an unhyphenated string returns a 1-element
+    list, hitting the "len(parts) < 2" fallback and returning the raw
+    11-digit string unchanged -- which can never match a hyphenated dataset
+    label's normalized "00069-2587" form. This was confirmed as the actual
+    cause of a real run resolving 11,475 real NDC9 prefixes yet matching
+    ZERO of the ~195k RX/OTC training rows to any of them -- a complete,
+    systematic format mismatch, not a lack of real overlap."""
+    s = str(ndc).strip()
+    if "-" in s:
+        parts = s.split("-")
+        if len(parts) < 2:
+            return s
+        return f"{parts[0].zfill(5)}-{parts[1].zfill(4)}"
+    if s.isdigit():
+        digits = s
+        if len(digits) == 10:
+            digits = "0" + digits  # short NDC10 missing its leading zero
+        if len(digits) == 11:
+            return f"{digits[:5]}-{digits[5:9]}"
+    return s
 
 # Diagnostic counters — the previous version of this cell silently swallowed
 # every exception (network error, HTTP error, bad JSON, unexpected response
@@ -693,40 +714,59 @@ print(f"Wrote manifest to {MANIFEST_PATH}")
 
 from collections import defaultdict as _dd
 
+# Indexed by position, not by row dict value -- confirmed via a live run to
+# matter: "Distinct classes in train" came out 4,233 LOWER than the total
+# class count, because the old version filtered with `r not in test_pick`
+# on lists of dicts. Python's `in` compares dicts by VALUE, not identity --
+# any class with two or more rows that happen to be dict-equal (same path/
+# label/side/domain/source/category/tier) had every one of those duplicate-
+# valued rows removed by a single `not in` check meant to remove only the
+# one actually picked, sometimes emptying "remaining" and leaving that
+# class with zero train images. Using integer indices throughout makes this
+# impossible regardless of whether any rows are duplicate-valued.
 rows_by_label = _dd(list)
-for r in labeled_rows:
-    rows_by_label[r["label"]].append(r)
+for i, r in enumerate(labeled_rows):
+    rows_by_label[r["label"]].append(i)
 
-train_rows, val_rows, test_rows = [], [], []
+train_idx, val_idx, test_idx = [], [], []
 rng = random.Random(SEED)
 
-for label, rows in rows_by_label.items():
-    rng.shuffle(rows)
-    consumer = [r for r in rows if r["domain"] == "consumer"]
-    reference = [r for r in rows if r["domain"] != "consumer"]
+for label, idxs in rows_by_label.items():
+    rng.shuffle(idxs)
+    consumer_idx = [i for i in idxs if labeled_rows[i]["domain"] == "consumer"]
+    reference_idx = [i for i in idxs if labeled_rows[i]["domain"] != "consumer"]
 
     # Guarantee at least one train image; everything else splits 70/15/15,
     # with consumer images preferentially routed to val/test so that split
     # isn't reference-only.
-    pool = reference[1:] + reference[:1] if len(reference) == 1 else reference
-    if len(rows) == 1:
-        train_rows.extend(rows)
+    if len(idxs) == 1:
+        train_idx.extend(idxs)
         continue
 
-    n_test = max(1, round(0.15 * len(rows))) if len(rows) >= 4 else (1 if consumer else 0)
-    n_val = max(1, round(0.15 * len(rows))) if len(rows) >= 4 else 0
+    n = len(idxs)
+    n_test = max(1, round(0.15 * n)) if n >= 4 else (1 if consumer_idx else 0)
+    n_val = max(1, round(0.15 * n)) if n >= 4 else 0
 
-    test_pick = (consumer[:n_test] + reference)[:n_test] if consumer else reference[:n_test]
-    remaining = [r for r in rows if r not in test_pick]
+    test_pick = (consumer_idx[:n_test] + reference_idx)[:n_test] if consumer_idx else reference_idx[:n_test]
+    test_pick_set = set(test_pick)
+    remaining = [i for i in idxs if i not in test_pick_set]
     val_pick = remaining[:n_val]
-    train_pick = [r for r in remaining if r not in val_pick]
+    val_pick_set = set(val_pick)
+    train_pick = [i for i in remaining if i not in val_pick_set]
 
-    train_rows.extend(train_pick)
-    val_rows.extend(val_pick)
-    test_rows.extend(test_pick)
+    train_idx.extend(train_pick)
+    val_idx.extend(val_pick)
+    test_idx.extend(test_pick)
+
+train_rows = [labeled_rows[i] for i in train_idx]
+val_rows = [labeled_rows[i] for i in val_idx]
+test_rows = [labeled_rows[i] for i in test_idx]
 
 print(f"train={len(train_rows)} val={len(val_rows)} test={len(test_rows)}")
 print("test domain mix:", Counter(r["domain"] for r in test_rows))
+print(f"Distinct classes: train={len(set(r['label'] for r in train_rows))} "
+      f"val={len(set(r['label'] for r in val_rows))} test={len(set(r['label'] for r in test_rows))} "
+      f"all={len(set(r['label'] for r in labeled_rows))}")
 
 
 
