@@ -1042,17 +1042,16 @@ import random as _random
 MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k images/epoch
 # Confirmed live at ~3.7s/batch (2 GPUs, DataParallel) -> ~50min/epoch.
 #
-# IMPORTANT with a large quota (e.g. 30h): Kaggle caps a single GPU session
-# at roughly 9h regardless of remaining quota -- a 30h budget means several
-# SEPARATE sessions, not one long run. This is sized to fit ONE session
-# (well under that ~9h cap, leaving room for preprocessing + a bigger
-# export/gate pass now that OTC data has been widened), not the whole
-# quota. Run this notebook repeatedly: each new session, attach the
-# PREVIOUS session's committed version of this same notebook as a Notebook
-# input so find_prior_checkpoint() (Section 8) picks up its checkpoint and
-# resumes instead of restarting from a random head. Repeat until the 30h
-# quota is spent -- that's ~4 sessions at this size, not 1.
-MAX_TRAIN_SECONDS = 6 * 3600
+# IMPORTANT: Kaggle caps a single GPU session at roughly 9h regardless of
+# remaining quota. Sized for a ~8h-per-trial plan across 3 sessions (~24h
+# of the 30h quota, leaving buffer): 6.5h training + ~1.5-2h for
+# preprocessing/export/gate, which will run a bit longer than before now
+# that OTC data has been widened (more images to embed at export/gate
+# time). Each session: attach the PREVIOUS session's committed version of
+# THIS notebook as a Notebook input so find_prior_checkpoint() (Section 8)
+# picks up its checkpoint and resumes instead of restarting from a random
+# head.
+MAX_TRAIN_SECONDS = int(6.5 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
@@ -1215,7 +1214,7 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
         # num_classes -- if the class count changed, those two are
         # reinitialized rather than skipped entirely, so training doesn't
         # silently continue with a shape mismatch or crash.
-        ckpt = torch.load(resume_from_path, map_location=DEVICE)
+        ckpt = torch.load(resume_from_path, map_location=DEVICE, weights_only=False)  # our own trusted checkpoint, contains non-tensor metadata (cfg/num_classes/label_classes)
         ckpt_state = ckpt["head_state_dict"]
         own_state = head.state_dict()
         loaded, reinitialized = [], []
@@ -1230,7 +1229,18 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
               f"as-is, reinitialized {len(reinitialized)} due to a shape "
               f"mismatch (expected if the class count changed): {reinitialized}", flush=True)
 
-    best_val_top5 = -1.0
+    # Carry forward the resumed checkpoint's own recorded score (if it has
+    # one -- best_projection_head.pt does, latest_checkpoint.pt doesn't)
+    # instead of resetting to -1.0. Without this, this session's FIRST
+    # quick_val_top5 reading -- taken against a random 400-class subset, so
+    # it's noisy -- would always count as "new best" and overwrite a
+    # genuinely better checkpoint from the previous session with a worse
+    # one, silently regressing exactly the artifact meant to be carried
+    # forward across a multi-session plan.
+    best_val_top5 = ckpt.get("val_top5", -1.0) if resume_from_path else -1.0
+    if resume_from_path and best_val_top5 > -1.0:
+        print(f"Carrying forward prior best val_top5={best_val_top5:.3f} as this "
+              f"session's starting bar -- won't overwrite it with a worse reading.", flush=True)
     best_state_dict = None
     global_step = 0
     start_time = _time.time()
@@ -1356,7 +1366,7 @@ except Exception as e:
             "to fall back to. See the traceback above for the real cause."
         ) from e
     print(f"Falling back to {_fallback_ckpt} (from before the crash)", flush=True)
-    _ckpt = torch.load(_fallback_ckpt, map_location=DEVICE)
+    _ckpt = torch.load(_fallback_ckpt, map_location=DEVICE, weights_only=False)
     label_list = _ckpt["label_classes"]
     head = ProjectionHead(in_dim=_ckpt["in_dim"], hidden_dim=CFG["proj_hidden_dim"],
                            out_dim=CFG["proj_embedding_dim"], num_classes=_ckpt["num_classes"]).to(DEVICE)
