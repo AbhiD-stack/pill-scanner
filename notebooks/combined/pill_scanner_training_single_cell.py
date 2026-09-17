@@ -1003,14 +1003,15 @@ import random as _random
 # would make even one epoch's duration unpredictable. Widen these once a
 # real run has been timed.
 MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k images/epoch
-# Confirmed live at ~3.7s/batch (2 GPUs, DataParallel) -> ~50min/epoch. Was
-# 6h; bumped to 7h now that the quick_val_top5 and C3PI-path-search bugs
-# (which used to burn most of a run's wall clock on validation/preprocessing
-# instead of training) are fixed -- with a ~13h Kaggle quota, ~30min
-# preprocessing, and export+gate now batched (not the multi-hour unbatched
-# cost from before), 7h training leaves real buffer for export/gate to
-# still complete and save artifacts even if that estimate is optimistic.
-MAX_TRAIN_SECONDS = 7 * 3600
+# Confirmed live at ~3.7s/batch (2 GPUs, DataParallel) -> ~50min/epoch.
+# Measured from the last full real run (preprocessing ~13min, training
+# 7h/9 epochs, export ~50min, gate ~16min): fixed overhead outside training
+# is ~1h20m. With only ~4.5h of Kaggle quota left for this run, 3h for
+# training leaves that same ~1h20m for preprocessing+export+gate plus a
+# real buffer -- narrower than the last run's 7h on purpose, to fit inside
+# what's actually left rather than risk getting cut off mid-run with
+# nothing exported.
+MAX_TRAIN_SECONDS = 3 * 3600
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
