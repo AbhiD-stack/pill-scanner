@@ -1004,14 +1004,18 @@ import random as _random
 # real run has been timed.
 MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k images/epoch
 # Confirmed live at ~3.7s/batch (2 GPUs, DataParallel) -> ~50min/epoch.
-# Measured from the last full real run (preprocessing ~13min, training
-# 7h/9 epochs, export ~50min, gate ~16min): fixed overhead outside training
-# is ~1h20m. With only ~4.5h of Kaggle quota left for this run, 3h for
-# training leaves that same ~1h20m for preprocessing+export+gate plus a
-# real buffer -- narrower than the last run's 7h on purpose, to fit inside
-# what's actually left rather than risk getting cut off mid-run with
-# nothing exported.
-MAX_TRAIN_SECONDS = 3 * 3600
+#
+# IMPORTANT with a large quota (e.g. 30h): Kaggle caps a single GPU session
+# at roughly 9h regardless of remaining quota -- a 30h budget means several
+# SEPARATE sessions, not one long run. This is sized to fit ONE session
+# (well under that ~9h cap, leaving room for preprocessing + a bigger
+# export/gate pass now that OTC data has been widened), not the whole
+# quota. Run this notebook repeatedly: each new session, attach the
+# PREVIOUS session's committed version of this same notebook as a Notebook
+# input so find_prior_checkpoint() (Section 8) picks up its checkpoint and
+# resumes instead of restarting from a random head. Repeat until the 30h
+# quota is spent -- that's ~4 sessions at this size, not 1.
+MAX_TRAIN_SECONDS = 6 * 3600
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
@@ -1129,7 +1133,30 @@ def quick_val_top5(head, train_rows, val_rows, gallery_per_class=2, sample_size=
     return hits / len(q_lbls)
 
 
-def train_projection_head(train_rows, val_rows, cfg):
+def find_prior_checkpoint():
+    """Kaggle GPU sessions cap out around 9h regardless of remaining quota,
+    so a 30h GPU-quota budget means several separate sessions, not one long
+    run. Without this, every session would start the projection head from
+    random weights and throw away everything the previous session learned.
+    Attach a PREVIOUS run of this same training notebook as a Notebook
+    input (Add Input -> Notebook -> search this notebook's own name -> pick
+    an earlier committed version) to carry its checkpoint forward."""
+    candidates = (
+        _glob.glob("/kaggle/input/**/best_projection_head.pt", recursive=True)
+        + _glob.glob("/kaggle/input/**/latest_checkpoint.pt", recursive=True)
+    )
+    return candidates[0] if candidates else None
+
+PRIOR_CHECKPOINT_PATH = find_prior_checkpoint()
+if PRIOR_CHECKPOINT_PATH:
+    print(f"Found prior checkpoint to resume from: {PRIOR_CHECKPOINT_PATH}")
+else:
+    print("No prior checkpoint found -- starting this projection head from scratch. "
+          "If you meant to resume a previous session, attach that earlier committed "
+          "version of THIS notebook as a Notebook input and re-run.")
+
+
+def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
     labels = sorted({r["label"] for r in train_rows})
     train_ds = PillDataset(train_rows, processor, training=True)
     natural_batches = max(1, len(train_rows) // (cfg["proj_batch_p"] * cfg["proj_batch_k"]))
@@ -1142,6 +1169,29 @@ def train_projection_head(train_rows, val_rows, cfg):
     head = ProjectionHead(in_dim=1024, hidden_dim=cfg["proj_hidden_dim"],
                            out_dim=cfg["proj_embedding_dim"], num_classes=len(labels)).to(DEVICE)
     opt = torch.optim.AdamW(head.parameters(), lr=cfg["proj_lr"], weight_decay=cfg["proj_weight_decay"])
+
+    if resume_from_path:
+        # Partial load: `proj` (the actual embedding MLP) doesn't depend on
+        # num_classes, so it transfers regardless of whether this session's
+        # class set changed (e.g. new OTC data added new classes since the
+        # checkpoint was saved). `classifier` and `arc_weight` DO depend on
+        # num_classes -- if the class count changed, those two are
+        # reinitialized rather than skipped entirely, so training doesn't
+        # silently continue with a shape mismatch or crash.
+        ckpt = torch.load(resume_from_path, map_location=DEVICE)
+        ckpt_state = ckpt["head_state_dict"]
+        own_state = head.state_dict()
+        loaded, reinitialized = [], []
+        for k, v in ckpt_state.items():
+            if k in own_state and own_state[k].shape == v.shape:
+                own_state[k] = v
+                loaded.append(k)
+            else:
+                reinitialized.append(k)
+        head.load_state_dict(own_state)
+        print(f"Resumed from {resume_from_path}: loaded {len(loaded)} tensors "
+              f"as-is, reinitialized {len(reinitialized)} due to a shape "
+              f"mismatch (expected if the class count changed): {reinitialized}", flush=True)
 
     best_val_top5 = -1.0
     best_state_dict = None
@@ -1245,7 +1295,7 @@ print(f"Max epochs configured: {CFG['proj_epochs']} | Wall-clock budget: {MAX_TR
 print("=" * 60, flush=True)
 
 try:
-    head, label_list = train_projection_head(train_rows, val_rows, CFG)
+    head, label_list = train_projection_head(train_rows, val_rows, CFG, resume_from_path=PRIOR_CHECKPOINT_PATH)
 except Exception as e:
     # Last-resort fallback: if training itself crashes despite the
     # resampling/skip logic already in PillDataset/quick_val_top5, don't
