@@ -1129,12 +1129,17 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # THIS notebook as a Notebook input so find_prior_checkpoint() (Section 8)
 # picks up its checkpoint and resumes instead of restarting from a random
 # head.
-# Trial 2 actually used 10.53h total (8.62h train + ~2.37h consistent
-# export/gate/preprocess overhead) -- over the ~9.5h/trial ceiling needed
-# to fit 2 more trials in the remaining quota. Tightened to 7h training so
-# total lands around 9.37h (7h + 2.37h overhead), with a bit of margin
-# under 9.5h rather than right at the edge.
-MAX_TRAIN_SECONDS = int(7 * 3600)
+# This is the decisive trial: LoRA is now confirmed working (torchao
+# incompatibility fixed + reproduced/verified locally), 16h of quota
+# remains, and the plan is one aggressive session rather than splitting
+# into two smaller, weaker ones. Trial 3's crash meant LoRA got ~0
+# actual training time despite a 5h phase budget, so this session gives
+# it the real, full run it never got: 2h resuming the head (unchanged
+# reasoning below) + 6h of LoRA fine-tuning. Historical overhead
+# (data pipeline + export/gate) has run ~2-2.5h on top of the training
+# budget, so total wall-clock should land around 10.5-11h, leaving a
+# few hours of the remaining 16h as a buffer rather than spending it all.
+MAX_TRAIN_SECONDS = int(8 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
@@ -1340,8 +1345,10 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_
     # genuinely better checkpoint from the previous session with a worse
     # one, silently regressing exactly the artifact meant to be carried
     # forward across a multi-session plan.
+    session_budget = max_seconds if max_seconds is not None else MAX_TRAIN_SECONDS
     _carried_val_top5 = ckpt.get("val_top5") if resume_from_path else None
     best_val_top5 = _carried_val_top5 if _carried_val_top5 is not None else -1.0
+    best_state_dict = None
     if resume_from_path and _carried_val_top5 is not None:
         print(f"Carrying forward prior best val_top5={best_val_top5:.3f} as this "
               f"session's starting bar -- won't overwrite it with a worse reading.", flush=True)
@@ -1353,9 +1360,6 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_
         # keeping the still-good resumed state, and discards the real
         # carried-forward score in the process.
         best_state_dict = {k: v.detach().clone() for k, v in head.state_dict().items()}
-    else:
-        session_budget = max_seconds if max_seconds is not None else MAX_TRAIN_SECONDS
-    best_state_dict = None
     global_step = 0
     start_time = _time.time()
     for epoch in range(cfg["proj_epochs"]):
