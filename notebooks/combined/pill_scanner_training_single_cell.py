@@ -1069,12 +1069,12 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # THIS notebook as a Notebook input so find_prior_checkpoint() (Section 8)
 # picks up its checkpoint and resumes instead of restarting from a random
 # head.
-# Trial 1 used ~9.05h total (6.5h train + ~2.4h preprocess/export/gate,
-# slightly more overhead than estimated since the dataset grew with full
-# OTC volume). With ~21h of the 30h quota left for 2 more trials, bumping
-# to 8h training per trial fits comfortably (~10.4h/trial total) and uses
-# the remaining budget fully instead of leaving it on the table.
-MAX_TRAIN_SECONDS = int(8 * 3600)
+# Trial 2 actually used 10.53h total (8.62h train + ~2.37h consistent
+# export/gate/preprocess overhead) -- over the ~9.5h/trial ceiling needed
+# to fit 2 more trials in the remaining quota. Tightened to 7h training so
+# total lands around 9.37h (7h + 2.37h overhead), with a bit of margin
+# under 9.5h rather than right at the edge.
+MAX_TRAIN_SECONDS = int(7 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
