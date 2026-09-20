@@ -1,10 +1,20 @@
+# ============================================================================
+# Pill Scanner — data acquisition, training, and the accuracy gate
+# ============================================================================
+
 
 # ============================================================================
 # 0. Setup
 # ============================================================================
-
 !pip install -q transformers timm albumentations peft pytesseract
 !apt-get -qq install -y tesseract-ocr > /dev/null
+# peft's LoRA dispatch calls is_torchao_available(), which raises ImportError
+# if torchao is installed but below its minimum supported version (0.16.0) -
+# Kaggle's container image ships 0.10.0. We never use torchao/quantization
+# for this project, so the simplest fix is to remove it: is_torchao_available()
+# then returns False via `find_spec("torchao") is None` instead of hitting the
+# version check at all.
+!pip uninstall -y -q torchao > /dev/null 2>&1 || true
 
 import os, json, glob, re, random
 from pathlib import Path
@@ -29,12 +39,39 @@ EXPORT_DIR = WORK_DIR / "export"
 for d in (METADATA_DIR, EXPORT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# --- Preflight: verify the LoRA/peft wiring actually works, in seconds, before
+# spending any of the session's GPU budget on the ~45min data pipeline or the
+# multi-hour training run. This is a real end-to-end check (get_peft_model +
+# a forward/backward pass), not just an import check, so it would have caught
+# Trial 3's torchao crash immediately instead of ~3.5h into the session.
+def _preflight_check_lora():
+    from peft import LoraConfig, get_peft_model
+    probe = nn.Module()
+    probe.query = nn.Linear(16, 16)
+    probe.key = nn.Linear(16, 16)
+    probe.value = nn.Linear(16, 16)
+    probe.forward = lambda x: probe.value(probe.key(probe.query(x)))
+    lora_cfg = LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, target_modules=["query", "key", "value"], bias="none")
+    peft_probe = get_peft_model(probe, lora_cfg)
+    out = peft_probe(torch.randn(2, 16))
+    out.sum().backward()
+    print("LoRA preflight check passed: get_peft_model + forward/backward OK.")
+
+LORA_PREFLIGHT_OK = False
+try:
+    _preflight_check_lora()
+    LORA_PREFLIGHT_OK = True
+except Exception as _preflight_exc:
+    import traceback as _preflight_tb
+    print("LoRA preflight check FAILED - Phase 2 (LoRA fine-tuning) will not run this trial.")
+    print(f"{type(_preflight_exc).__name__}: {_preflight_exc}")
+    print(_preflight_tb.format_exc())
+    print("Continuing with Phase 1 (head-only training) only; no GPU budget was wasted on this failure.")
 
 
 # ============================================================================
 # 1. Attach datasets
 # ============================================================================
-
 # 1.1 Kaggle-hosted datasets. Confirmed-US: epillid (NIH C3PI-derived). The
 # rest are non-US or unconfirmed origin, kept for volume/diversity per an
 # explicit "primarily US, maximize images per class" call — DailyMed (its
@@ -79,10 +116,7 @@ for key, root in dataset_roots.items():
         if n >= 20:
             break
         print(" ", p.relative_to(root))
-        n += 1
-
-
-# 1.2 NIH C3PI / RxIMAGE — reads notebooks/c3pi_acquisition.ipynb's committed
+        n += 1# 1.2 NIH C3PI / RxIMAGE — reads notebooks/c3pi_acquisition.ipynb's committed
 # output the same way Section 1.3 reads DailyMed's, instead of the earlier
 # live-discovery-and-download version of this cell (that version predates
 # c3pi_acquisition.ipynb actually being run — its real, confirmed URLs are
@@ -131,11 +165,9 @@ else:
           "this is the reference-tier RX source, ~48k images / 4,236 NDCs.")
 
 
-
 # ============================================================================
 # 1.3 DailyMed bulk SPL (US RX+OTC) — from a separate acquisition notebook
 # ============================================================================
-
 import glob as _glob
 import zipfile as _zipfile_dm
 
@@ -174,11 +206,9 @@ else:
           "here, and re-run this cell.")
 
 
-
 # ============================================================================
 # 2. Drug metadata (imprint / color / shape / score marks)
 # ============================================================================
-
 import sys
 import time
 import urllib.parse, urllib.request, urllib.error
@@ -440,11 +470,9 @@ print(f"OTC-specific tier: {len(OTC_NDC9_SET)} distinct NDC9 prefixes from the 4
       f"(used to fix C3PI's hardcoded RX category tag where it's wrong)")
 
 
-
 # ============================================================================
 # 3. Build the unified image manifest
 # ============================================================================
-
 def default_label_from_filename(path):
     return Path(path).stem.split("_", 1)[0]
 
@@ -774,12 +802,9 @@ with open(MANIFEST_PATH, "w", newline="") as f:
     w.writerows(manifest_rows)
 print(f"Wrote manifest to {MANIFEST_PATH}")
 
-
-
 # ============================================================================
 # 4. Train / val / test split
 # ============================================================================
-
 from collections import defaultdict as _dd
 
 # Indexed by position, not by row dict value -- confirmed via a live run to
@@ -837,11 +862,9 @@ print(f"Distinct classes: train={len(set(r['label'] for r in train_rows))} "
       f"all={len(set(r['label'] for r in labeled_rows))}")
 
 
-
 # ============================================================================
 # 5. Domain-randomization augmentation
 # ============================================================================
-
 import albumentations as A
 
 reference_domain_aug = A.Compose([
@@ -872,11 +895,9 @@ def augment_for_domain(pil_image, domain):
     return Image.fromarray(aug(image=arr)["image"])
 
 
-
 # ============================================================================
 # 6. Dataset + P-K batch sampler
 # ============================================================================
-
 from torch.utils.data import Dataset, Sampler
 
 class PillDataset(Dataset):
@@ -938,11 +959,9 @@ class PKSampler(Sampler):
         return self.batches_per_epoch
 
 
-
 # ============================================================================
 # 7. Model: frozen DINOv2-large + projection head
 # ============================================================================
-
 from transformers import AutoImageProcessor, AutoModel
 
 CFG = {
@@ -1048,8 +1067,6 @@ def extract_backbone_feature_trainable(pixel_values):
         out = backbone(pixel_values=pixel_values.to(DEVICE))
         feat = out.pooler_output if getattr(out, "pooler_output", None) is not None else out.last_hidden_state[:, 0]
         return feat.float()
-
-
 def arcface_logits(emb, labels, weight, s, m, num_classes):
     weight_n = F.normalize(weight, dim=1)
     cos = emb @ weight_n.T
@@ -1087,11 +1104,9 @@ def triplet_loss(emb, labels, margin):
     return torch.stack(loss_terms).mean() if loss_terms else torch.tensor(0.0, device=emb.device)
 
 
-
 # ============================================================================
 # 8. Training loop
 # ============================================================================
-
 import time as _time
 import random as _random
 
@@ -1627,7 +1642,7 @@ except Exception as e:
 # unvalidated code, and must never be able to lose the good Phase 1 result
 # above. On any failure here, print the traceback and keep going with
 # whatever Phase 1 already produced.
-if CFG.get("run_lora") and LORA_PHASE_SECONDS > 0:
+if CFG.get("run_lora") and LORA_PHASE_SECONDS > 0 and LORA_PREFLIGHT_OK:
     try:
         head, label_list, _lora_val_top5 = finetune_with_lora(
             head, label_list, train_rows, val_rows, CFG, LORA_PHASE_SECONDS,
@@ -1642,14 +1657,12 @@ if CFG.get("run_lora") and LORA_PHASE_SECONDS > 0:
               "skipped for this session, nothing already good was lost.", flush=True)
 else:
     print(f"Skipping LoRA phase (run_lora={CFG.get('run_lora')}, "
-          f"LORA_PHASE_SECONDS={LORA_PHASE_SECONDS})", flush=True)
-
-
+          f"LORA_PHASE_SECONDS={LORA_PHASE_SECONDS}, "
+          f"LORA_PREFLIGHT_OK={LORA_PREFLIGHT_OK})", flush=True)
 
 # ============================================================================
 # 9. Export reference gallery + deployment artifacts
 # ============================================================================
-
 @torch.no_grad()
 def embed_rows(rows, head, label_list, batch_size=64):
     """label_list must be the model's canonical training label order (the
@@ -1766,11 +1779,9 @@ def export_artifacts(head, label_list, gallery_rows, val_top5=None):
 deployed_gallery = export_artifacts(head, label_list, train_rows + val_rows, val_top5=best_val_top5_reached)
 
 
-
 # ============================================================================
 # 10. Accuracy gate — mandatory before deploying to the app
 # ============================================================================
-
 # Inlined from eval/evaluate.py (kept in sync manually) — GitHub-repo
 # attachment has been unreliable in practice, so this cell doesn't depend on
 # it for the unattended overnight run.
@@ -2064,3 +2075,7 @@ except Exception as e:
 (EXPORT_DIR / "RUN_SUMMARY.txt").write_text("\n".join(_summary_lines))
 print(f"\nWrote {EXPORT_DIR / 'RUN_SUMMARY.txt'} -- read this first if anything looks wrong.")
 
+
+# ============================================================================
+# Summary of what's real vs. what needs verification before trusting this run
+# ============================================================================
