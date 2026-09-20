@@ -1129,21 +1129,19 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # THIS notebook as a Notebook input so find_prior_checkpoint() (Section 8)
 # picks up its checkpoint and resumes instead of restarting from a random
 # head.
-# Kaggle hard-kills the whole notebook at a fixed wall-clock limit (~9h)
-# regardless of remaining weekly quota -- a session that gets killed
-# mid-export loses the gate numbers entirely, checkpoints or not. That is
-# a much worse outcome than a shorter but SAFE LoRA phase, so this budget
-# is set with real margin under that cutoff, not right up against it.
-# Historical overhead (data pipeline + export/gate) has run ~2.4-2.55h on
-# top of the training budget across all 3 prior trials -- using 2.5h as
-# the planning estimate: 6h training (2h resuming the head + 4h of LoRA
-# fine-tuning) + 2.5h overhead = ~8.5h total, leaving ~30min of margin
-# under the 9h limit even before counting the mid-epoch budget checks
-# below (which bound any overrun to a single batch, not a full epoch --
-# Trial 2 overran its budget by 37 minutes from exactly that gap).
-MAX_TRAIN_SECONDS = int(6 * 3600)
+# Confirmed (another notebook ran this long without being killed): the
+# real ceiling is ~9.5h total wall-clock, not ~9h -- use that, but still
+# with real margin, not right at the edge. Historical overhead (data
+# pipeline + export/gate) has run 2.37-2.55h across all 3 prior trials;
+# planning for 2.6h (slightly above the observed max, since OTC volume
+# has only grown) leaves 6.9h for training. With the mid-epoch budget
+# checks below bounding any overrun to a single batch (not a full epoch,
+# which is what actually cost Trial 2 37 minutes), this can be planned
+# close to the real ceiling instead of leaving slack for that failure
+# mode too. Rounding down slightly for margin: 6.5h training total.
+MAX_TRAIN_SECONDS = int(6.5 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
-VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
+VAL_EVERY_N_BATCHES = 100     # cheap periodic validation for best-checkpoint selection -- tightened from 200 so the last checkpoint before a time-budget stop is never more than ~100 batches stale
 
 @torch.no_grad()
 def _embed_for_quickval(rows, head, batch_size=64):
@@ -1632,7 +1630,12 @@ print("=" * 60, flush=True)
 # actually raise the accuracy ceiling instead of refining within it. If a
 # checkpoint already shows this is at least the 2nd session (resuming),
 # spend less time re-confirming the head and more on the new phase.
-PROJ_PHASE_SECONDS = int(2 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# Trial 3 already showed head-only training plateauing at val_top5=0.943
+# within its first ~2h of resumed training -- this phase is refining
+# within an already-saturated ceiling, while LoRA is the one phase that
+# can actually raise it. Shortened from 2h to 1.5h so the stakes-relevant
+# extra time goes to LoRA instead of re-confirming a plateau.
+PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
