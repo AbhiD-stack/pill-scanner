@@ -1232,7 +1232,22 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
 
     head = ProjectionHead(in_dim=1024, hidden_dim=cfg["proj_hidden_dim"],
                            out_dim=cfg["proj_embedding_dim"], num_classes=len(labels)).to(DEVICE)
-    opt = torch.optim.AdamW(head.parameters(), lr=cfg["proj_lr"], weight_decay=cfg["proj_weight_decay"])
+
+    # Confirmed live across two resumed sessions: with a fixed lr and no
+    # decay, a resumed session's train loss went UP for several epochs
+    # right after loading an already-decent checkpoint (10.5 -> 13+) before
+    # slowly recovering -- the optimizer taking full-size steps on top of a
+    # good starting point knocks it out of that region instead of
+    # refining it, and a whole session can be spent mostly recovering
+    # rather than improving net. Two fixes: halve the base LR when
+    # resuming (less aggressive than a from-scratch start needs), and
+    # decay it across the session (cosine, floor at 5% of base) so later
+    # epochs make smaller, more precise updates instead of continuing to
+    # perturb at full strength for the whole session.
+    session_lr = cfg["proj_lr"] * (0.5 if resume_from_path else 1.0)
+    opt = torch.optim.AdamW(head.parameters(), lr=session_lr, weight_decay=cfg["proj_weight_decay"])
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=20, eta_min=session_lr * 0.05)  # T_max=20 ~= a session's typical epoch count
 
     if resume_from_path:
         # Partial load: `proj` (the actual embedding MLP) doesn't depend on
@@ -1265,11 +1280,21 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
     # genuinely better checkpoint from the previous session with a worse
     # one, silently regressing exactly the artifact meant to be carried
     # forward across a multi-session plan.
-    best_val_top5 = ckpt.get("val_top5", -1.0) if resume_from_path else -1.0
-    if resume_from_path and best_val_top5 > -1.0:
+    _carried_val_top5 = ckpt.get("val_top5") if resume_from_path else None
+    best_val_top5 = _carried_val_top5 if _carried_val_top5 is not None else -1.0
+    if resume_from_path and _carried_val_top5 is not None:
         print(f"Carrying forward prior best val_top5={best_val_top5:.3f} as this "
               f"session's starting bar -- won't overwrite it with a worse reading.", flush=True)
-    best_state_dict = None
+        # Seed best_state_dict with the just-loaded (already-good) weights,
+        # not None -- otherwise, if this session never beats the carried-
+        # forward score, the code falls through to "no checkpoint was ever
+        # taken" at the end and silently exports the LAST epoch's weights
+        # (however this session ended up, possibly worse) instead of
+        # keeping the still-good resumed state, and discards the real
+        # carried-forward score in the process.
+        best_state_dict = {k: v.detach().clone() for k, v in head.state_dict().items()}
+    else:
+        best_state_dict = None
     global_step = 0
     start_time = _time.time()
     for epoch in range(cfg["proj_epochs"]):
@@ -1328,6 +1353,8 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
         epoch_secs = _time.time() - epoch_start
         print(f"epoch {epoch+1}/{cfg['proj_epochs']} loss={epoch_loss / len(sampler):.4f} "
               f"({epoch_secs:.0f}s, {_time.time() - start_time:.0f}s total elapsed)", flush=True)
+        lr_scheduler.step()
+        print(f"  lr for next epoch: {opt.param_groups[0]['lr']:.2e}", flush=True)
 
         # Cheap per-epoch checkpoint (head weights only, no gallery
         # re-embedding) so progress survives even if this is the last epoch
@@ -1345,8 +1372,9 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
     else:
         print("No quick-val checkpoint was ever taken (training too short?) — "
               "returning the final epoch's weights as-is.", flush=True)
+        best_val_top5 = None  # nothing real to carry forward -- don't export a fabricated -1.0/0.0
 
-    return head, labels
+    return head, labels, best_val_top5
 
 # Pre-flight summary — know what you're about to spend GPU time on before it
 # actually starts training.
@@ -1370,7 +1398,8 @@ print(f"Max epochs configured: {CFG['proj_epochs']} | Wall-clock budget: {MAX_TR
 print("=" * 60, flush=True)
 
 try:
-    head, label_list = train_projection_head(train_rows, val_rows, CFG, resume_from_path=PRIOR_CHECKPOINT_PATH)
+    head, label_list, best_val_top5_reached = train_projection_head(
+        train_rows, val_rows, CFG, resume_from_path=PRIOR_CHECKPOINT_PATH)
 except Exception as e:
     # Last-resort fallback: if training itself crashes despite the
     # resampling/skip logic already in PillDataset/quick_val_top5, don't
@@ -1399,6 +1428,7 @@ except Exception as e:
     head = ProjectionHead(in_dim=_ckpt["in_dim"], hidden_dim=CFG["proj_hidden_dim"],
                            out_dim=CFG["proj_embedding_dim"], num_classes=_ckpt["num_classes"]).to(DEVICE)
     head.load_state_dict(_ckpt["head_state_dict"])
+    best_val_top5_reached = _ckpt.get("val_top5")
 
 
 
@@ -1492,17 +1522,26 @@ def embed_rows(rows, head, label_list, batch_size=64):
     }, kept_rows
 
 
-def export_artifacts(head, label_list, gallery_rows):
+def export_artifacts(head, label_list, gallery_rows, val_top5=None):
     """Returns the gallery embeddings it computed -- the Section 10 gate
     needs the exact same train+val embeddings for its reference gallery,
     and re-embedding 180k+ images a second time from scratch would double
-    an already-expensive pass for no reason."""
+    an already-expensive pass for no reason.
+
+    val_top5 (when known) gets saved into the checkpoint dict -- this is
+    the ACTUAL file downloaded/re-uploaded between Kaggle sessions in the
+    multi-trial resume plan. Confirmed live: the previous version of this
+    function never included it, so the next session's "carry forward the
+    prior best score" logic always fell back to -1.0 (the field it was
+    looking for never existed in the file actually being resumed from),
+    silently discarding the real prior score as the bar to beat."""
     torch.save({
         "head_state_dict": head.state_dict(),
         "cfg": CFG,
         "in_dim": 1024,
         "num_classes": len(label_list),
         "label_classes": label_list,
+        "val_top5": val_top5,
     }, EXPORT_DIR / "best_projection_head.pt")
 
     gallery, _ = embed_rows(gallery_rows, head, label_list)
@@ -1510,7 +1549,7 @@ def export_artifacts(head, label_list, gallery_rows):
     print(f"Exported artifacts to {EXPORT_DIR}")
     return gallery
 
-deployed_gallery = export_artifacts(head, label_list, train_rows + val_rows)
+deployed_gallery = export_artifacts(head, label_list, train_rows + val_rows, val_top5=best_val_top5_reached)
 
 
 
