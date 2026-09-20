@@ -1036,6 +1036,20 @@ def extract_backbone_feature(pixel_values):
         return feat.float()  # cast back to fp32 before the (unfrozen, non-autocast) projection head
 
 
+def extract_backbone_feature_trainable(pixel_values):
+    """Same as extract_backbone_feature but WITHOUT torch.no_grad() -- used
+    only during the LoRA backbone fine-tune phase (Section 8.5), where the
+    backbone has trainable LoRA adapter weights and needs gradients to
+    flow back through it. Every other caller (quick_val_top5, embed_rows,
+    the head-only training phase) keeps using the no_grad version above --
+    they never need backbone gradients, and forcing them through this path
+    would just waste memory/compute."""
+    with torch.autocast(device_type=DEVICE.type, enabled=(DEVICE.type == "cuda")):
+        out = backbone(pixel_values=pixel_values.to(DEVICE))
+        feat = out.pooler_output if getattr(out, "pooler_output", None) is not None else out.last_hidden_state[:, 0]
+        return feat.float()
+
+
 def arcface_logits(emb, labels, weight, s, m, num_classes):
     weight_n = F.normalize(weight, dim=1)
     cos = emb @ weight_n.T
@@ -1251,7 +1265,7 @@ else:
           "version of THIS notebook as a Notebook input and re-run.")
 
 
-def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
+def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_seconds=None):
     labels = sorted({r["label"] for r in train_rows})
     train_ds = PillDataset(train_rows, processor, training=True)
     natural_batches = max(1, len(train_rows) // (cfg["proj_batch_p"] * cfg["proj_batch_k"]))
@@ -1325,14 +1339,15 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
         # carried-forward score in the process.
         best_state_dict = {k: v.detach().clone() for k, v in head.state_dict().items()}
     else:
-        best_state_dict = None
+        session_budget = max_seconds if max_seconds is not None else MAX_TRAIN_SECONDS
+    best_state_dict = None
     global_step = 0
     start_time = _time.time()
     for epoch in range(cfg["proj_epochs"]):
         elapsed = _time.time() - start_time
-        if elapsed > MAX_TRAIN_SECONDS:
-            print(f"MAX_TRAIN_SECONDS budget ({MAX_TRAIN_SECONDS}s) reached after "
-                  f"{epoch} epoch(s) — stopping here so export/gate still run.", flush=True)
+        if elapsed > session_budget:
+            print(f"Projection-head phase budget ({session_budget}s) reached after "
+                  f"{epoch} epoch(s) — moving to the next phase.", flush=True)
             break
 
         head.train()
@@ -1407,6 +1422,132 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None):
 
     return head, labels, best_val_top5
 
+
+def finetune_with_lora(head, labels, train_rows, val_rows, cfg, max_seconds, resume_lora_path=None):
+    """Phase 2: unfreeze the backbone via LoRA (parameter-efficient adapter
+    layers on the attention Q/K/V projections) and fine-tune it jointly
+    with the head, using the same ArcFace/SupCon/CE/triplet loss composition.
+
+    Why this exists: with the backbone fully frozen (Section 8), accuracy
+    is capped by how separable pill classes already are in DINOv2's
+    pretrained feature space -- more head-only epochs refine WITHIN that
+    ceiling, they can't raise it. Quick-val plateauing around 0.94 across
+    two full resumed trials, with the real gate barely moving, is
+    consistent with being near that ceiling. LoRA lets the backbone itself
+    reshape toward what actually separates these specific pill classes
+    (imprint/color/shape), at a fraction of the memory/compute cost of
+    full fine-tuning and with the pretrained weights themselves left
+    untouched (only small low-rank adapter matrices train), which keeps
+    catastrophic forgetting risk low.
+
+    This is genuinely new, unvalidated code path in this project -- wrap
+    ANY call to this function in a try/except at the call site and fall
+    back to the Section 8 head-only result on failure. Never let this
+    phase's failure lose an otherwise-good run."""
+    from peft import LoraConfig, get_peft_model, PeftModel
+
+    global backbone
+    inner_backbone = backbone.module if isinstance(backbone, nn.DataParallel) else backbone
+    if resume_lora_path:
+        # Resuming: load the actual saved adapter weights, not a fresh
+        # zero-initialized one -- get_peft_model() always creates a new
+        # adapter (B matrix zero-init), so it can't be used for resume.
+        peft_backbone = PeftModel.from_pretrained(inner_backbone, resume_lora_path, is_trainable=True)
+        print(f"Resumed LoRA adapter weights from {resume_lora_path}", flush=True)
+    else:
+        lora_cfg = LoraConfig(
+            r=cfg["lora_r"], lora_alpha=cfg["lora_alpha"], lora_dropout=cfg["lora_dropout"],
+            target_modules=["query", "key", "value"],  # DINOv2's HF attention impl follows ViT naming
+            bias="none",
+        )
+        peft_backbone = get_peft_model(inner_backbone, lora_cfg)
+    peft_backbone.print_trainable_parameters()
+    _n_gpus = torch.cuda.device_count() if DEVICE.type == "cuda" else 0
+    backbone = nn.DataParallel(peft_backbone).to(DEVICE) if _n_gpus > 1 else peft_backbone.to(DEVICE)
+
+    train_ds = PillDataset(train_rows, processor, training=True)
+    natural_batches = max(1, len(train_rows) // (cfg["proj_batch_p"] * cfg["proj_batch_k"]))
+    batches_per_epoch = min(natural_batches, MAX_BATCHES_PER_EPOCH)
+    sampler = PKSampler(train_rows, labels, cfg["proj_batch_p"], cfg["proj_batch_k"],
+                         batches_per_epoch=batches_per_epoch)
+
+    backbone_trainable_params = [p for p in backbone.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW([
+        {"params": backbone_trainable_params, "lr": cfg["lora_lr_backbone"]},
+        {"params": head.parameters(), "lr": cfg["lora_lr_head"]},
+    ], weight_decay=cfg["proj_weight_decay"])
+
+    best_val_top5 = -1.0
+    best_state_dict = None
+    global_step = 0
+    start_time = _time.time()
+    print(f"finetune_with_lora: {batches_per_epoch} batches/epoch, budget {max_seconds/3600:.2f}h, "
+          f"lora_lr_backbone={cfg['lora_lr_backbone']:.1e}, lora_lr_head={cfg['lora_lr_head']:.1e}", flush=True)
+
+    for epoch in range(cfg["lora_epochs"]):
+        if _time.time() - start_time > max_seconds:
+            print(f"LoRA phase budget ({max_seconds}s) reached after {epoch} epoch(s) -- stopping.", flush=True)
+            break
+        head.train()
+        epoch_loss = 0.0
+        epoch_start = _time.time()
+        for batch_num, batch_indices in enumerate(sampler, 1):
+            pixel_values = torch.stack([train_ds[i][0] for i in batch_indices]).to(DEVICE)
+            batch_labels = torch.tensor([train_ds[i][1] for i in batch_indices], device=DEVICE)
+
+            feat = extract_backbone_feature_trainable(pixel_values)
+            out = head(feat)
+            emb, logits = out["emb"], out["logits"]
+
+            ce = F.cross_entropy(logits, batch_labels)
+            arc_logits = arcface_logits(emb, batch_labels, head.arc_weight, cfg["arcface_s"], cfg["arcface_m"], len(labels))
+            arc = F.cross_entropy(arc_logits, batch_labels)
+            sc = supcon_loss(emb, batch_labels, cfg["supcon_temperature"])
+            tr = triplet_loss(emb, batch_labels, cfg["triplet_margin"])
+            loss = (cfg["ce_weight"] * ce + cfg["arcface_weight"] * arc
+                    + cfg["supcon_weight"] * sc + cfg["triplet_weight"] * tr)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(backbone_trainable_params + list(head.parameters()), 1.0)
+            opt.step()
+            epoch_loss += loss.item()
+            global_step += 1
+
+            if batch_num % PRINT_EVERY_N_BATCHES == 0:
+                print(f"  [lora] epoch {epoch+1} batch {batch_num}/{batches_per_epoch} "
+                      f"loss={loss.item():.4f} ({_time.time() - epoch_start:.0f}s into this epoch)", flush=True)
+
+            if global_step % VAL_EVERY_N_BATCHES == 0:
+                val_top5 = quick_val_top5(head, train_rows, val_rows)
+                if val_top5 is not None:
+                    print(f"  [lora quick val] step {global_step}: top5≈{val_top5:.3f} "
+                          f"(best so far: {max(best_val_top5, val_top5):.3f})", flush=True)
+                    if val_top5 > best_val_top5:
+                        best_val_top5 = val_top5
+                        best_state_dict = {k: v.detach().clone() for k, v in head.state_dict().items()}
+                        peft_backbone.save_pretrained(str(EXPORT_DIR / "lora_adapter"))
+                        torch.save({"head_state_dict": best_state_dict, "cfg": cfg,
+                                    "in_dim": 1024, "num_classes": len(labels),
+                                    "label_classes": labels, "val_top5": val_top5,
+                                    "global_step": global_step, "lora_phase": True},
+                                   EXPORT_DIR / "best_projection_head.pt")
+                        print(f"  -> new best LoRA-phase checkpoint saved (val_top5={val_top5:.3f}), "
+                              f"adapter saved to {EXPORT_DIR / 'lora_adapter'}", flush=True)
+
+        print(f"[lora] epoch {epoch+1}/{cfg['lora_epochs']} loss={epoch_loss / len(sampler):.4f} "
+              f"({_time.time() - epoch_start:.0f}s, {_time.time() - start_time:.0f}s total elapsed)", flush=True)
+
+    if best_state_dict is not None:
+        print(f"Restoring best LoRA-phase checkpoint (val_top5≈{best_val_top5:.3f})", flush=True)
+        head.load_state_dict(best_state_dict)
+        peft_backbone.save_pretrained(str(EXPORT_DIR / "lora_adapter"))
+    else:
+        print("No LoRA-phase quick-val checkpoint was ever taken -- head unchanged from phase 1.", flush=True)
+        best_val_top5 = None
+
+    return head, labels, best_val_top5
+
 # Pre-flight summary — know what you're about to spend GPU time on before it
 # actually starts training.
 print("=" * 60, flush=True)
@@ -1428,9 +1569,30 @@ print(f"Max epochs configured: {CFG['proj_epochs']} | Wall-clock budget: {MAX_TR
       f"(whichever limit hits first stops training and moves to export/gate)", flush=True)
 print("=" * 60, flush=True)
 
+# Split this session's budget between two phases: a short continuation of
+# head-only training (keeps the embedding space current/warmed up), then
+# the LoRA backbone fine-tune phase for the rest -- the phase that can
+# actually raise the accuracy ceiling instead of refining within it. If a
+# checkpoint already shows this is at least the 2nd session (resuming),
+# spend less time re-confirming the head and more on the new phase.
+PROJ_PHASE_SECONDS = int(2 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
+
+def find_prior_lora_adapter():
+    """Same reasoning as find_prior_checkpoint() -- attach a previous
+    session's committed notebook as input to carry the LoRA adapter
+    forward too, not just the head."""
+    candidates = _glob.glob("/kaggle/input/**/adapter_model.safetensors", recursive=True)
+    return str(Path(candidates[0]).parent) if candidates else None
+
+PRIOR_LORA_ADAPTER_PATH = find_prior_lora_adapter()
+if PRIOR_LORA_ADAPTER_PATH:
+    print(f"Found prior LoRA adapter to resume from: {PRIOR_LORA_ADAPTER_PATH}")
+
 try:
     head, label_list, best_val_top5_reached = train_projection_head(
-        train_rows, val_rows, CFG, resume_from_path=PRIOR_CHECKPOINT_PATH)
+        train_rows, val_rows, CFG, resume_from_path=PRIOR_CHECKPOINT_PATH,
+        max_seconds=PROJ_PHASE_SECONDS)
 except Exception as e:
     # Last-resort fallback: if training itself crashes despite the
     # resampling/skip logic already in PillDataset/quick_val_top5, don't
@@ -1460,6 +1622,27 @@ except Exception as e:
                            out_dim=CFG["proj_embedding_dim"], num_classes=_ckpt["num_classes"]).to(DEVICE)
     head.load_state_dict(_ckpt["head_state_dict"])
     best_val_top5_reached = _ckpt.get("val_top5")
+
+# Phase 2: LoRA backbone fine-tune, wrapped defensively -- this is new,
+# unvalidated code, and must never be able to lose the good Phase 1 result
+# above. On any failure here, print the traceback and keep going with
+# whatever Phase 1 already produced.
+if CFG.get("run_lora") and LORA_PHASE_SECONDS > 0:
+    try:
+        head, label_list, _lora_val_top5 = finetune_with_lora(
+            head, label_list, train_rows, val_rows, CFG, LORA_PHASE_SECONDS,
+            resume_lora_path=PRIOR_LORA_ADAPTER_PATH)
+        if _lora_val_top5 is not None:
+            best_val_top5_reached = _lora_val_top5
+    except Exception as e:
+        import traceback as _tb4
+        print(f"finetune_with_lora CRASHED: {type(e).__name__}: {e}", flush=True)
+        print(_tb4.format_exc(), flush=True)
+        print("Continuing with the Phase 1 (head-only) result -- LoRA phase "
+              "skipped for this session, nothing already good was lost.", flush=True)
+else:
+    print(f"Skipping LoRA phase (run_lora={CFG.get('run_lora')}, "
+          f"LORA_PHASE_SECONDS={LORA_PHASE_SECONDS})", flush=True)
 
 
 
