@@ -1129,17 +1129,19 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # THIS notebook as a Notebook input so find_prior_checkpoint() (Section 8)
 # picks up its checkpoint and resumes instead of restarting from a random
 # head.
-# This is the decisive trial: LoRA is now confirmed working (torchao
-# incompatibility fixed + reproduced/verified locally), 16h of quota
-# remains, and the plan is one aggressive session rather than splitting
-# into two smaller, weaker ones. Trial 3's crash meant LoRA got ~0
-# actual training time despite a 5h phase budget, so this session gives
-# it the real, full run it never got: 2h resuming the head (unchanged
-# reasoning below) + 6h of LoRA fine-tuning. Historical overhead
-# (data pipeline + export/gate) has run ~2-2.5h on top of the training
-# budget, so total wall-clock should land around 10.5-11h, leaving a
-# few hours of the remaining 16h as a buffer rather than spending it all.
-MAX_TRAIN_SECONDS = int(8 * 3600)
+# Kaggle hard-kills the whole notebook at a fixed wall-clock limit (~9h)
+# regardless of remaining weekly quota -- a session that gets killed
+# mid-export loses the gate numbers entirely, checkpoints or not. That is
+# a much worse outcome than a shorter but SAFE LoRA phase, so this budget
+# is set with real margin under that cutoff, not right up against it.
+# Historical overhead (data pipeline + export/gate) has run ~2.4-2.55h on
+# top of the training budget across all 3 prior trials -- using 2.5h as
+# the planning estimate: 6h training (2h resuming the head + 4h of LoRA
+# fine-tuning) + 2.5h overhead = ~8.5h total, leaving ~30min of margin
+# under the 9h limit even before counting the mid-epoch budget checks
+# below (which bound any overrun to a single batch, not a full epoch --
+# Trial 2 overran its budget by 37 minutes from exactly that gap).
+MAX_TRAIN_SECONDS = int(6 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 200     # cheap periodic validation for best-checkpoint selection
 
@@ -1372,7 +1374,24 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_
         head.train()
         epoch_loss = 0.0
         epoch_start = _time.time()
+        _budget_hit_mid_epoch = False
         for batch_num, batch_indices in enumerate(sampler, 1):
+            # Mid-epoch check, not just between epochs -- Trial 2 overran
+            # its configured budget by 37 minutes (8h configured, 8.62h
+            # actual) purely because a full ~50min epoch was allowed to
+            # finish once started, even after the budget was already
+            # spent. Against a hard external session cutoff (Kaggle kills
+            # the whole notebook, checkpoints or not), that gap is exactly
+            # what can lose the run. Checking every batch is cheap
+            # (one time.time() call) and bounds the overrun to a single
+            # batch (~3.7s) instead of up to a full epoch.
+            if _time.time() - start_time > session_budget:
+                print(f"Projection-head phase budget ({session_budget}s) reached "
+                      f"mid-epoch {epoch+1} (batch {batch_num}) — stopping now, "
+                      f"not waiting for the epoch to finish.", flush=True)
+                _budget_hit_mid_epoch = True
+                break
+
             pixel_values = torch.stack([train_ds[i][0] for i in batch_indices]).to(DEVICE)
             batch_labels = torch.tensor([train_ds[i][1] for i in batch_indices], device=DEVICE)
 
@@ -1416,7 +1435,7 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_
                         print(f"  -> new best checkpoint saved (val_top5={val_top5:.3f})", flush=True)
 
         epoch_secs = _time.time() - epoch_start
-        print(f"epoch {epoch+1}/{cfg['proj_epochs']} loss={epoch_loss / len(sampler):.4f} "
+        print(f"epoch {epoch+1}/{cfg['proj_epochs']} loss={epoch_loss / max(batch_num, 1):.4f} "
               f"({epoch_secs:.0f}s, {_time.time() - start_time:.0f}s total elapsed)", flush=True)
         lr_scheduler.step()
         print(f"  lr for next epoch: {opt.param_groups[0]['lr']:.2e}", flush=True)
@@ -1429,6 +1448,9 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_
                     "in_dim": 1024, "num_classes": len(labels), "label_classes": labels,
                     "epoch": epoch + 1},
                    EXPORT_DIR / "latest_checkpoint.pt")
+
+        if _budget_hit_mid_epoch:
+            break
 
     if best_state_dict is not None:
         print(f"Restoring best-validated checkpoint (val_top5≈{best_val_top5:.3f}) "
@@ -1510,7 +1532,20 @@ def finetune_with_lora(head, labels, train_rows, val_rows, cfg, max_seconds, res
         head.train()
         epoch_loss = 0.0
         epoch_start = _time.time()
+        _budget_hit_mid_epoch = False
         for batch_num, batch_indices in enumerate(sampler, 1):
+            # Same mid-epoch check as train_projection_head -- a LoRA epoch
+            # (backward pass through the backbone, not just the head) is
+            # more expensive per-batch than head-only training, so letting
+            # one run to completion after the budget is already spent
+            # risks an even bigger overrun against a hard external cutoff.
+            if _time.time() - start_time > max_seconds:
+                print(f"LoRA phase budget ({max_seconds}s) reached mid-epoch "
+                      f"{epoch+1} (batch {batch_num}) -- stopping now, not "
+                      f"waiting for the epoch to finish.", flush=True)
+                _budget_hit_mid_epoch = True
+                break
+
             pixel_values = torch.stack([train_ds[i][0] for i in batch_indices]).to(DEVICE)
             batch_labels = torch.tensor([train_ds[i][1] for i in batch_indices], device=DEVICE)
 
@@ -1554,8 +1589,11 @@ def finetune_with_lora(head, labels, train_rows, val_rows, cfg, max_seconds, res
                         print(f"  -> new best LoRA-phase checkpoint saved (val_top5={val_top5:.3f}), "
                               f"adapter saved to {EXPORT_DIR / 'lora_adapter'}", flush=True)
 
-        print(f"[lora] epoch {epoch+1}/{cfg['lora_epochs']} loss={epoch_loss / len(sampler):.4f} "
+        print(f"[lora] epoch {epoch+1}/{cfg['lora_epochs']} loss={epoch_loss / max(batch_num, 1):.4f} "
               f"({_time.time() - epoch_start:.0f}s, {_time.time() - start_time:.0f}s total elapsed)", flush=True)
+
+        if _budget_hit_mid_epoch:
+            break
 
     if best_state_dict is not None:
         print(f"Restoring best LoRA-phase checkpoint (val_top5≈{best_val_top5:.3f})", flush=True)
