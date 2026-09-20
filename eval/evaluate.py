@@ -194,6 +194,45 @@ def evaluate(rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: li
     return report
 
 
+def build_dual_side_query_rows(rows: list[QueryRow], max_pairs_per_label: int = 3) -> list[QueryRow]:
+    """Simulates the app's planned "scan both sides" feature: fuses a
+    front-side query embedding with a back-side query embedding of the
+    same class into ONE combined query (normalize, sum, renormalize),
+    instead of evaluating single images only. Only classes with at least
+    one row tagged side="front" AND one tagged side="back" in this query
+    set can be paired.
+
+    This is currently real for ePillID and C3PI (both tag genuine
+    front/back), but NOT for DailyMed -- SPL package-label photos aren't
+    modeled as front/back, so every DailyMed row (all of this project's
+    OTC volume) is side="unknown" and can never be paired here. Callers
+    MUST report n_classes_pairable/n_pairs alongside any dual-side
+    accuracy number, so a good RX number can't be misread as "this is what
+    scanning both sides does for OTC too" when there's currently no OTC
+    coverage to measure that against at all.
+    """
+    by_label_side: dict[str, dict[str, list[QueryRow]]] = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        by_label_side[r.true_label][r.side].append(r)
+
+    fused_rows: list[QueryRow] = []
+    for by_side in by_label_side.values():
+        fronts = by_side.get("front", [])
+        backs = by_side.get("back", [])
+        n_pairs = min(len(fronts), len(backs), max_pairs_per_label)
+        for i in range(n_pairs):
+            f_emb = F.normalize(fronts[i].embedding, dim=0)
+            b_emb = F.normalize(backs[i].embedding, dim=0)
+            fused_emb = F.normalize(f_emb + b_emb, dim=0)
+            src = fronts[i]
+            fused_rows.append(QueryRow(
+                embedding=fused_emb, true_label=src.true_label, domain=src.domain,
+                side="dual_front_back", images_in_class=src.images_in_class,
+                category=src.category, tier=src.tier,
+            ))
+    return fused_rows
+
+
 def load_query_rows(path: Path) -> list[QueryRow]:
     """Expects a torch-saved list of dicts with keys: embedding, true_label,
     domain, side, images_in_class. Adapt this loader to whatever format the
@@ -240,7 +279,6 @@ def main() -> int:
 
     report = evaluate(rows, gallery_emb, gallery_labels)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    json.dump(report, open(args.out, "w"), indent=2, default=str)
 
     print(json.dumps(report["overall"], indent=2))
     print("\nBy domain:")
@@ -259,6 +297,35 @@ def main() -> int:
         print(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
         if group == "priority_OTC" and block.get("n", 0) == 0:
             print("    ^ zero priority-tier OTC queries — the top-500 OTC number is unknown, not zero.")
+
+    # Dual-side ("scan both sides") simulation — fuses a front+back query
+    # pair into one combined embedding instead of evaluating single images
+    # only, since that's the actual planned app feature. Only real for
+    # classes with genuine front AND back tags in this query set (ePillID/
+    # C3PI right now, not DailyMed/OTC) — report coverage explicitly so a
+    # good RX number here is never misread as an OTC number too.
+    dual_rows = build_dual_side_query_rows(rows)
+    print(f"\nDual-side (scan-both-sides) simulation: {len(dual_rows)} fused query pairs "
+          f"across {len({r.true_label for r in dual_rows})} distinct classes with real "
+          f"front+back data available (currently ePillID/C3PI only — DailyMed/OTC rows "
+          f"are all side='unknown' and can't be paired here yet).")
+    dual_report = None
+    if dual_rows:
+        dual_report = evaluate(dual_rows, gallery_emb, gallery_labels)
+        report["dual_side"] = dual_report
+        print(f"  overall: n={dual_report['overall'].get('n')} "
+              f"top5={dual_report['overall'].get('top5_acc')} top10={dual_report['overall'].get('top10_acc')}")
+        for group, block in sorted(dual_report.get("by_tier_and_category", {}).items()):
+            print(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+        single_rx = report["by_category"].get("RX", {}).get("top5_acc")
+        dual_rx = dual_report["by_category"].get("RX", {}).get("top5_acc") if "RX" in dual_report.get("by_category", {}) else None
+        if single_rx is not None and dual_rx is not None:
+            print(f"  RX single-image top5={single_rx} vs RX dual-side top5={dual_rx} "
+                  f"(delta={dual_rx - single_rx:+.3f})")
+    else:
+        print("  No classes had both a front-tagged and back-tagged query row — "
+              "dual-side accuracy is unmeasured, not zero.")
+    json.dump(report, open(args.out, "w"), indent=2, default=str)
 
     failed = False
     if args.min_top5_consumer is not None:

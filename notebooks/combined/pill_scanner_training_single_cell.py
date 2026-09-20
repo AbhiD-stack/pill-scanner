@@ -563,11 +563,28 @@ def add_dailymed():
     dict lookups) rather than a single guessed sibling path per row -- more
     robust if the real extracted layout doesn't put every image directly
     under dailymed_images/, and avoids reintroducing a per-row filesystem
-    search like the one that stalled add_c3pi() for hours."""
+    search like the one that stalled add_c3pi() for hours.
+
+    SIDE TAGGING: every DailyMed row previously got side="unknown"
+    unconditionally, because _document_image_refs() (the acquisition
+    notebook's parser) lumps every package-label-section image for a
+    document into one flat list per NDC with no front/back distinction
+    kept. For NDCs where the underlying SPL document actually had 2+
+    package-label images (front-of-box, back-of-box, etc. -- common for
+    OTC packaging in particular), this is real ordering information being
+    thrown away. Recovered here (no new download, no re-running the
+    acquisition notebook needed) by grouping this function's OWN rows by
+    NDC after loading, and for any NDC with >=2 image rows, tagging the
+    first as "front" and second as "back" by document order -- a
+    heuristic (like C3PI's own guess_side(), not verified ground truth)
+    but real signal instead of none. This is what gives OTC any coverage
+    at all for the app's planned "scan both sides" feature; without it,
+    every OTC row stays "unknown" and can never be paired for that eval."""
     if not DAILYMED_MANIFEST_PATH:
         return
     import csv as _csv2
     import os as _os2
+    from collections import defaultdict as _dd_dm
     manifest_dir = Path(DAILYMED_MANIFEST_PATH).parent
     filename_index = {}
     for search_root in (manifest_dir / "dailymed_images", manifest_dir):
@@ -577,6 +594,7 @@ def add_dailymed():
             for fn in filenames:
                 filename_index.setdefault(fn, str(Path(dirpath) / fn))
     n_missing = 0
+    start_idx = len(manifest_rows)
     with open(DAILYMED_MANIFEST_PATH) as f:
         for row in _csv2.DictReader(f):
             path = row["path"]
@@ -588,6 +606,19 @@ def add_dailymed():
             manifest_rows.append({**row, "path": path})
     if n_missing:
         print(f"add_dailymed: {n_missing} manifest rows had no resolvable image file")
+
+    by_ndc = _dd_dm(list)
+    for i in range(start_idx, len(manifest_rows)):
+        by_ndc[manifest_rows[i]["label"]].append(i)
+    n_front_back_tagged = 0
+    for idxs in by_ndc.values():
+        if len(idxs) >= 2:
+            manifest_rows[idxs[0]]["side"] = "front"
+            manifest_rows[idxs[1]]["side"] = "back"
+            n_front_back_tagged += 2
+    print(f"add_dailymed: recovered real front/back side tags for {n_front_back_tagged} rows "
+          f"across {sum(1 for idxs in by_ndc.values() if len(idxs) >= 2)} NDCs with 2+ package images "
+          f"(heuristic: document order, not verified ground truth)")
 
 IMAGE_EXTENSIONS = ("*.jpg", "*.jpeg", "*.png")
 
@@ -1688,6 +1719,35 @@ def evaluate(rows, gallery_emb, gallery_labels):
     ]
     return report
 
+def build_dual_side_query_rows(rows, max_pairs_per_label=3):
+    """Simulates the app's planned "scan both sides" feature: fuses a
+    front-side query embedding with a back-side query embedding of the
+    same class into ONE combined query (normalize, sum, renormalize)
+    instead of evaluating single images only. Only classes with at least
+    one row tagged side="front" AND one tagged side="back" can be paired
+    -- real for ePillID/C3PI (RX) and now DailyMed too (front/back
+    recovered from document order in Section 3's add_dailymed(), covering
+    OTC as well, not just RX)."""
+    by_label_side = _defaultdict(lambda: _defaultdict(list))
+    for r in rows:
+        by_label_side[r.true_label][r.side].append(r)
+    fused_rows = []
+    for by_side in by_label_side.values():
+        fronts = by_side.get("front", [])
+        backs = by_side.get("back", [])
+        n_pairs = min(len(fronts), len(backs), max_pairs_per_label)
+        for i in range(n_pairs):
+            f_emb = F.normalize(fronts[i].embedding, dim=0)
+            b_emb = F.normalize(backs[i].embedding, dim=0)
+            fused_emb = F.normalize(f_emb + b_emb, dim=0)
+            src = fronts[i]
+            fused_rows.append(QueryRow(
+                embedding=fused_emb, true_label=src.true_label, domain=src.domain,
+                side="dual_front_back", images_in_class=src.images_in_class,
+                category=src.category, tier=src.tier,
+            ))
+    return fused_rows
+
 MIN_TOP5_CONSUMER = 0.70  # tune this to what you actually need before shipping
 
 # Everything below is wrapped so that ANY unexpected failure here (the gate
@@ -1747,6 +1807,39 @@ try:
         _log("Worst 10 classes by top5 accuracy:")
         for w in report["worst_classes_top5"][:10]:
             _log(f"  {w['label']}: top5={w['top5_acc']} (n={w['n_queries']})")
+
+        # Dual-side ("scan both sides") simulation -- the app's planned
+        # feature. Fuses a front+back query pair into one combined
+        # embedding instead of single-image-only evaluation. RX and OTC
+        # are reported separately and given equal weight here -- OTC now
+        # has real (if heuristic) front/back coverage via add_dailymed()'s
+        # document-order recovery, not left for "later."
+        dual_rows = build_dual_side_query_rows(query_rows)
+        _log(f"\nDual-side (scan-both-sides) simulation: {len(dual_rows)} fused query pairs "
+             f"across {len({r.true_label for r in dual_rows})} distinct classes with real "
+             f"front+back data available.")
+        if dual_rows:
+            dual_report = evaluate(dual_rows, gallery["embeddings"],
+                                    [label_list[i] for i in gallery["label_indices"].tolist()])
+            _log(f"  overall: n={dual_report['overall'].get('n')} "
+                 f"top5={dual_report['overall'].get('top5_acc')} top10={dual_report['overall'].get('top10_acc')}")
+            for group, block in sorted(dual_report.get("by_tier_and_category", {}).items()):
+                _log(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+            for cat in ("RX", "OTC"):
+                single_n = report["by_category"].get(cat, {}).get("n", 0)
+                single_acc = report["by_category"].get(cat, {}).get("top5_acc")
+                dual_n = dual_report["by_category"].get(cat, {}).get("n", 0)
+                dual_acc = dual_report["by_category"].get(cat, {}).get("top5_acc")
+                if single_acc is not None and dual_acc is not None:
+                    _log(f"  {cat} single-image top5={single_acc} (n={single_n}) vs "
+                         f"{cat} dual-side top5={dual_acc} (n={dual_n}) "
+                         f"(delta={dual_acc - single_acc:+.3f})")
+                else:
+                    _log(f"  {cat}: no dual-side pairs available yet (n={dual_n})")
+        else:
+            _log("  No classes had both a front-tagged and back-tagged query row -- "
+                 "dual-side accuracy is unmeasured, not zero.")
+
         # Three real outcomes, not two -- printing "GATE FAILED" when there's
         # simply no consumer-domain data YET to check (a known, expected gap,
         # not a model-quality problem) was confirmed to read as "the run
