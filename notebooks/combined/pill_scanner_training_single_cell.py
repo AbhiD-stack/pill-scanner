@@ -935,21 +935,54 @@ class PillDataset(Dataset):
 
 class PKSampler(Sampler):
     """Yields batches of P classes x K samples/class, matching the
-    proj_batch_p / proj_batch_k hyperparameters from pill-id's config.json."""
+    proj_batch_p / proj_batch_k hyperparameters from pill-id's config.json.
 
-    def __init__(self, rows, labels, p, k, batches_per_epoch):
+    otc_priority_labels / rx_priority_labels + otc_quota / rx_quota:
+    guarantee a fixed number of priority-tier classes in EVERY batch,
+    instead of drawing all P classes uniformly from the full label set.
+    Confirmed necessary via Trial 4's real gate: with ~700 OTC-priority
+    classes out of 95,665 total, uniform P=12 sampling gave an OTC-priority
+    class only a ~9% chance of appearing in any given batch at all -- most
+    batches never showed the model a single OTC-priority image. That is
+    consistent with (and a plausible root cause of) priority_OTC coming in
+    at top5=23%/top10=33% while priority_RX (more numerous, so better
+    represented even under uniform sampling) reached top5=63%/top10=69%."""
+
+    def __init__(self, rows, labels, p, k, batches_per_epoch,
+                 otc_priority_labels=None, rx_priority_labels=None,
+                 otc_quota=0, rx_quota=0):
         self.by_label = defaultdict(list)
         for i, r in enumerate(rows):
             self.by_label[r["label"]].append(i)
         self.labels = [l for l in labels if len(self.by_label[l]) >= 1]
         self.p, self.k = p, k
         self.batches_per_epoch = batches_per_epoch
+        label_set = set(self.labels)
+        self.otc_priority_labels = [l for l in (otc_priority_labels or []) if l in label_set]
+        self.rx_priority_labels = [l for l in (rx_priority_labels or []) if l in label_set]
+        self.otc_quota = max(0, min(otc_quota, self.p))
+        self.rx_quota = max(0, min(rx_quota, self.p - self.otc_quota))
 
     def __iter__(self):
         for _ in range(self.batches_per_epoch):
-            chosen_labels = random.sample(self.labels, min(self.p, len(self.labels)))
+            chosen = []
+            if self.otc_priority_labels and self.otc_quota:
+                chosen += random.sample(self.otc_priority_labels,
+                                         min(self.otc_quota, len(self.otc_priority_labels)))
+            if self.rx_priority_labels and self.rx_quota:
+                slots_left = self.p - len(chosen)
+                take = min(self.rx_quota, slots_left, len(self.rx_priority_labels))
+                if take > 0:
+                    chosen += random.sample(self.rx_priority_labels, take)
+            slots_left = self.p - len(chosen)
+            if slots_left > 0:
+                # A uniform-random fill can, rarely, re-pick a class already
+                # in `chosen` -- harmless (that class just gets a slightly
+                # bigger slice of this one batch), not worth an O(N) filter
+                # against the full 95k-label list on every batch.
+                chosen += random.sample(self.labels, min(slots_left, len(self.labels)))
             batch = []
-            for label in chosen_labels:
+            for label in chosen:
                 pool = self.by_label[label]
                 batch.extend(random.choices(pool, k=self.k) if len(pool) < self.k
                              else random.sample(pool, self.k))
@@ -1110,6 +1143,31 @@ def triplet_loss(emb, labels, margin):
 import time as _time
 import random as _random
 
+def priority_label_lists(rows):
+    """OTC/RX priority-tier labels present in `rows`, for PKSampler's
+    oversampling quotas -- computed once per phase (not per batch)."""
+    otc, rx, seen = [], [], set()
+    for r in rows:
+        lbl = r["label"]
+        if lbl in seen:
+            continue
+        seen.add(lbl)
+        if r.get("tier") == "priority":
+            if r.get("category") == "OTC":
+                otc.append(lbl)
+            elif r.get("category") == "RX":
+                rx.append(lbl)
+    return otc, rx
+
+# Of each proj_batch_p=12-class batch: guarantee this many are OTC-priority
+# and RX-priority classes specifically, leaving the rest (6/12) to uniform
+# sampling over all 95,665 classes so the broader embedding/retrieval
+# geometry doesn't collapse to priority-only. Weighted toward OTC (4 vs 2)
+# because it's the far weaker number (Trial 4: priority_OTC top5=23% vs
+# priority_RX top5=63%) and the explicit target for this trial.
+PK_OTC_QUOTA = 4
+PK_RX_QUOTA = 2
+
 # Bounded regardless of dataset size, and a hard wall-clock budget, so the
 # training loop always finishes and reaches export/gate rather than risking
 # a mid-run kill from Kaggle's session time limit with nothing saved. The
@@ -1129,17 +1187,17 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # THIS notebook as a Notebook input so find_prior_checkpoint() (Section 8)
 # picks up its checkpoint and resumes instead of restarting from a random
 # head.
-# Confirmed (another notebook ran this long without being killed): the
-# real ceiling is ~9.5h total wall-clock, not ~9h -- use that, but still
-# with real margin, not right at the edge. Historical overhead (data
-# pipeline + export/gate) has run 2.37-2.55h across all 3 prior trials;
-# planning for 2.6h (slightly above the observed max, since OTC volume
-# has only grown) leaves 6.9h for training. With the mid-epoch budget
-# checks below bounding any overrun to a single batch (not a full epoch,
-# which is what actually cost Trial 2 37 minutes), this can be planned
-# close to the real ceiling instead of leaving slack for that failure
-# mode too. Rounding down slightly for margin: 6.5h training total.
-MAX_TRAIN_SECONDS = int(6.5 * 3600)
+# Trial 4 confirmed the mid-epoch budget check works exactly as designed
+# (both phases stopped within seconds of their configured budget, zero
+# overrun) and gave real overhead numbers to plan from: pipeline 0.56h +
+# export 1.1h + gate 0.65h = 2.31h fixed overhead, regardless of training
+# time. The binding constraint THIS trial is not the ~9.5h session wall-
+# clock ceiling -- it's the 7h of GPU quota actually remaining. Planning
+# for 2.4h overhead (slightly above the observed 2.31h for margin) leaves
+# 4.6h for training; targeting 6.5h total (not 7h) leaves a real ~30min
+# buffer, since running out of quota mid-session is a hard stop with
+# nothing exported -- worse than a shorter but guaranteed-complete run.
+MAX_TRAIN_SECONDS = int(4 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 100     # cheap periodic validation for best-checkpoint selection -- tightened from 200 so the last checkpoint before a time-budget stop is never more than ~100 batches stale
 
@@ -1229,11 +1287,35 @@ def quick_val_top5(head, train_rows, val_rows, gallery_per_class=2, sample_size=
     head.eval()
     from collections import defaultdict as _dd3
     by_label = _dd3(list)
+    label_tier_cat = {}
     for r in train_rows:
         by_label[r["label"]].append(r)
-    gallery_classes = list(by_label.keys())
+        if r["label"] not in label_tier_cat:
+            label_tier_cat[r["label"]] = (r.get("category"), r.get("tier"))
+    all_classes = list(by_label.keys())
+
+    # Prioritize OTC-priority, then RX-priority, then fill any remaining
+    # budget with a random sample of everything else -- a uniform random
+    # sample of up to max_gallery_classes from all 95,665 classes (the old
+    # behavior) gave priority-tier classes (a few thousand at most) almost
+    # no representation, making this proxy track long-tail performance,
+    # not the actual gate metric. Confirmed by Trial 4: this proxy hit
+    # 0.950 right before the real gate came back at priority top5=0.567 --
+    # too big a gap to trust the proxy's checkpoint selection as-is.
+    otc_classes = [c for c in all_classes if label_tier_cat[c] == ("OTC", "priority")]
+    rx_classes = [c for c in all_classes if label_tier_cat[c] == ("RX", "priority")]
+    other_classes = [c for c in all_classes if c not in otc_classes and c not in rx_classes]
+
+    gallery_classes = list(otc_classes)
     if len(gallery_classes) > max_gallery_classes:
         gallery_classes = _random.sample(gallery_classes, max_gallery_classes)
+    budget = max_gallery_classes - len(gallery_classes)
+    if budget > 0 and rx_classes:
+        gallery_classes += _random.sample(rx_classes, min(budget, len(rx_classes)))
+        budget = max_gallery_classes - len(gallery_classes)
+    if budget > 0 and other_classes:
+        gallery_classes += _random.sample(other_classes, min(budget, len(other_classes)))
+
     gallery_rows = [r for c in gallery_classes for r in by_label[c][:gallery_per_class]]
     # Filter to gallery_classes BEFORE sampling, not after -- sampling 200
     # random val rows first and filtering after would leave ~1 usable query
@@ -1290,8 +1372,14 @@ def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_
     train_ds = PillDataset(train_rows, processor, training=True)
     natural_batches = max(1, len(train_rows) // (cfg["proj_batch_p"] * cfg["proj_batch_k"]))
     batches_per_epoch = min(natural_batches, MAX_BATCHES_PER_EPOCH)
+    _otc_labels, _rx_labels = priority_label_lists(train_rows)
     sampler = PKSampler(train_rows, labels, cfg["proj_batch_p"], cfg["proj_batch_k"],
-                         batches_per_epoch=batches_per_epoch)
+                         batches_per_epoch=batches_per_epoch,
+                         otc_priority_labels=_otc_labels, rx_priority_labels=_rx_labels,
+                         otc_quota=PK_OTC_QUOTA, rx_quota=PK_RX_QUOTA)
+    print(f"train_projection_head: {len(_otc_labels)} OTC-priority / {len(_rx_labels)} "
+          f"RX-priority classes available for oversampling (quota {PK_OTC_QUOTA}+{PK_RX_QUOTA} "
+          f"of every {cfg['proj_batch_p']}-class batch)", flush=True)
     print(f"train_projection_head: {batches_per_epoch} batches/epoch "
           f"(capped from {natural_batches} natural batches), {len(labels)} classes", flush=True)
 
@@ -1507,8 +1595,14 @@ def finetune_with_lora(head, labels, train_rows, val_rows, cfg, max_seconds, res
     train_ds = PillDataset(train_rows, processor, training=True)
     natural_batches = max(1, len(train_rows) // (cfg["proj_batch_p"] * cfg["proj_batch_k"]))
     batches_per_epoch = min(natural_batches, MAX_BATCHES_PER_EPOCH)
+    _otc_labels, _rx_labels = priority_label_lists(train_rows)
     sampler = PKSampler(train_rows, labels, cfg["proj_batch_p"], cfg["proj_batch_k"],
-                         batches_per_epoch=batches_per_epoch)
+                         batches_per_epoch=batches_per_epoch,
+                         otc_priority_labels=_otc_labels, rx_priority_labels=_rx_labels,
+                         otc_quota=PK_OTC_QUOTA, rx_quota=PK_RX_QUOTA)
+    print(f"finetune_with_lora: {len(_otc_labels)} OTC-priority / {len(_rx_labels)} "
+          f"RX-priority classes available for oversampling (quota {PK_OTC_QUOTA}+{PK_RX_QUOTA} "
+          f"of every {cfg['proj_batch_p']}-class batch)", flush=True)
 
     backbone_trainable_params = [p for p in backbone.parameters() if p.requires_grad]
     opt = torch.optim.AdamW([
@@ -1630,12 +1724,13 @@ print("=" * 60, flush=True)
 # actually raise the accuracy ceiling instead of refining within it. If a
 # checkpoint already shows this is at least the 2nd session (resuming),
 # spend less time re-confirming the head and more on the new phase.
-# Trial 3 already showed head-only training plateauing at val_top5=0.943
-# within its first ~2h of resumed training -- this phase is refining
-# within an already-saturated ceiling, while LoRA is the one phase that
-# can actually raise it. Shortened from 2h to 1.5h so the stakes-relevant
-# extra time goes to LoRA instead of re-confirming a plateau.
-PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# Trial 4 confirmed head-only training is saturated (plateaued around the
+# same val_top5 range again) -- with only 4.6h of training time available
+# this trial, give it just enough to warm back up under the NEW quota-
+# based sampler (priority/OTC classes are now heavily oversampled, a real
+# change from what saturated before) and push everything else into LoRA,
+# the phase that can actually reshape the backbone's features.
+PROJ_PHASE_SECONDS = int(1 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
