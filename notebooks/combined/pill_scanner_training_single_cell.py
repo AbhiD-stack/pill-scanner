@@ -1187,17 +1187,14 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # THIS notebook as a Notebook input so find_prior_checkpoint() (Section 8)
 # picks up its checkpoint and resumes instead of restarting from a random
 # head.
-# Trial 4 confirmed the mid-epoch budget check works exactly as designed
-# (both phases stopped within seconds of their configured budget, zero
-# overrun) and gave real overhead numbers to plan from: pipeline 0.56h +
-# export 1.1h + gate 0.65h = 2.31h fixed overhead, regardless of training
-# time. The binding constraint THIS trial is not the ~9.5h session wall-
-# clock ceiling -- it's the 7h of GPU quota actually remaining. Planning
-# for 2.4h overhead (slightly above the observed 2.31h for margin) leaves
-# 4.6h for training; targeting 6.5h total (not 7h) leaves a real ~30min
-# buffer, since running out of quota mid-session is a hard stop with
-# nothing exported -- worse than a shorter but guaranteed-complete run.
-MAX_TRAIN_SECONDS = int(4 * 3600)
+# Quota reset back to 30h, so the binding constraint is back to the
+# per-session wall-clock ceiling (~9.5h, confirmed by another notebook
+# running that long without being killed), not remaining quota. Trial 4
+# gave real overhead numbers: pipeline 0.56h + export 1.1h + gate 0.65h =
+# 2.31h fixed, regardless of training time. Planning for 2.4h (slight
+# margin above observed) leaves 6.9h for training; using 6.5h keeps a
+# real ~35min buffer under the 9.5h ceiling rather than running at the edge.
+MAX_TRAIN_SECONDS = int(6.5 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 100     # cheap periodic validation for best-checkpoint selection -- tightened from 200 so the last checkpoint before a time-budget stop is never more than ~100 batches stale
 
@@ -1724,13 +1721,13 @@ print("=" * 60, flush=True)
 # actually raise the accuracy ceiling instead of refining within it. If a
 # checkpoint already shows this is at least the 2nd session (resuming),
 # spend less time re-confirming the head and more on the new phase.
-# Trial 4 confirmed head-only training is saturated (plateaued around the
-# same val_top5 range again) -- with only 4.6h of training time available
-# this trial, give it just enough to warm back up under the NEW quota-
-# based sampler (priority/OTC classes are now heavily oversampled, a real
-# change from what saturated before) and push everything else into LoRA,
-# the phase that can actually reshape the backbone's features.
-PROJ_PHASE_SECONDS = int(1 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# Trial 4 confirmed head-only training is saturated under the old sampler,
+# but the sampler itself just changed (OTC/RX-priority classes are now
+# heavily oversampled) -- give it 1.5h to re-stabilize under that new
+# distribution before switching to LoRA, rather than assuming the old
+# plateau still applies unchanged. With 30h of quota available again,
+# there's room for this without starving LoRA (still gets 5h).
+PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
