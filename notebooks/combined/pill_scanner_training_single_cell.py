@@ -2058,6 +2058,73 @@ def evaluate(rows, gallery_emb, gallery_labels):
     ]
     return report
 
+def restrict_gallery(gallery_emb, gallery_labels, keep_labels):
+    """Filters the reference gallery down to only `keep_labels` before
+    ranking -- simulates an app mode where the search space is deliberately
+    narrowed (e.g. "this is a common drug" / user picked RX or OTC) instead
+    of always searching the full ~95k-class gallery. Every long-tail class
+    removed from the candidate pool is one less thing a priority-tier query
+    can be confused with -- priority-tier RX currently competes against
+    tens of thousands of long-tail RX classes it would never face in a
+    "top-500 common drugs" deployment mode."""
+    keep_idx = [i for i, lbl in enumerate(gallery_labels) if lbl in keep_labels]
+    if not keep_idx:
+        return gallery_emb[:0], []
+    idx_t = torch.tensor(keep_idx, dtype=torch.long)
+    return gallery_emb[idx_t], [gallery_labels[i] for i in keep_idx]
+
+
+def evaluate_deployment_modes(rows, gallery_emb, gallery_labels):
+    """Two app deployment modes that restrict the search gallery instead of
+    always searching the full ~95k-class gallery -- a different, likely
+    bigger lever than more training time, since priority-tier RX currently
+    competes against tens of thousands of long-tail RX classes a "common
+    drugs only" mode would never expose it to. Only meaningful for
+    priority-tier queries -- a long-tail pill genuinely isn't one of the
+    500 common drugs, so restricting to priority-only would just make it
+    unfindable, not more findable.
+
+    "priority_tier_gallery": app knows "this is a common drug" but not RX
+      vs OTC -- gallery restricted to ALL priority-tier classes together.
+    "priority_tier_and_category_gallery": app additionally knows RX vs OTC
+      (user picked it) -- gallery restricted to just that category's
+      priority-tier classes. This is the "ask RX or OTC, browse the rest
+      if unsure" idea."""
+    priority_rows = [r for r in rows if r.tier == "priority" and r.category in ("RX", "OTC")]
+    if not priority_rows:
+        return {"priority_tier_gallery": {"n": 0}, "priority_tier_and_category_gallery": {}}
+
+    priority_labels = {r.true_label for r in priority_rows}
+    otc_labels = {r.true_label for r in priority_rows if r.category == "OTC"}
+    rx_labels = {r.true_label for r in priority_rows if r.category == "RX"}
+
+    report = {}
+    pt_gallery_emb, pt_gallery_labels = restrict_gallery(gallery_emb, gallery_labels, priority_labels)
+    rankings = _rank_all_rows(priority_rows, pt_gallery_emb, pt_gallery_labels)
+    report["priority_tier_gallery"] = _accuracy_block(priority_rows, rankings)
+    by_cat = _defaultdict(list)
+    for i, r in enumerate(priority_rows):
+        by_cat[r.category].append(i)
+    report["priority_tier_gallery_by_category"] = {
+        c: _accuracy_block([priority_rows[i] for i in idxs], [rankings[i] for i in idxs])
+        for c, idxs in by_cat.items()
+    }
+
+    otc_rows = [r for r in priority_rows if r.category == "OTC"]
+    rx_rows = [r for r in priority_rows if r.category == "RX"]
+    cat_report = {}
+    if otc_rows:
+        otc_gallery_emb, otc_gallery_labels = restrict_gallery(gallery_emb, gallery_labels, otc_labels)
+        otc_rankings = _rank_all_rows(otc_rows, otc_gallery_emb, otc_gallery_labels)
+        cat_report["OTC"] = _accuracy_block(otc_rows, otc_rankings)
+    if rx_rows:
+        rx_gallery_emb, rx_gallery_labels = restrict_gallery(gallery_emb, gallery_labels, rx_labels)
+        rx_rankings = _rank_all_rows(rx_rows, rx_gallery_emb, rx_gallery_labels)
+        cat_report["RX"] = _accuracy_block(rx_rows, rx_rankings)
+    report["priority_tier_and_category_gallery"] = cat_report
+    return report
+
+
 def build_dual_side_query_rows(rows, max_pairs_per_label=3):
     """Simulates the app's planned "scan both sides" feature: fuses a
     front-side query embedding with a back-side query embedding of the
@@ -2146,6 +2213,30 @@ try:
         _log("Worst 10 classes by top5 accuracy:")
         for w in report["worst_classes_top5"][:10]:
             _log(f"  {w['label']}: top5={w['top5_acc']} (n={w['n_queries']})")
+
+        # Restricted-gallery deployment modes -- "common drugs only" and
+        # "common drugs + known RX/OTC" search spaces, tested against the
+        # SAME embeddings already computed above (no new training needed).
+        # Priority-tier queries currently compete against tens of thousands
+        # of long-tail classes in the unrestricted gallery; this measures
+        # what accuracy looks like in an app mode that deliberately narrows
+        # the search space instead. See evaluate_deployment_modes() above.
+        deploy_report = evaluate_deployment_modes(query_rows, gallery["embeddings"],
+                                                    [label_list[i] for i in gallery["label_indices"].tolist()])
+        report["deployment_modes"] = deploy_report
+        _log("\nRestricted-gallery deployment modes (same embeddings, smaller search space):")
+        pt = deploy_report.get("priority_tier_gallery", {})
+        _log(f"  priority_tier_gallery (gallery = priority-tier only, RX+OTC): "
+             f"n={pt.get('n')} top5={pt.get('top5_acc')} top10={pt.get('top10_acc')}")
+        for cat, block in deploy_report.get("priority_tier_gallery_by_category", {}).items():
+            _log(f"    {cat}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+        _log("  priority_tier_and_category_gallery (gallery = just that category's priority-tier classes):")
+        for cat, block in deploy_report.get("priority_tier_and_category_gallery", {}).items():
+            _log(f"    {cat}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+            unrestricted = report["by_tier_and_category"].get(f"priority_{cat}", {})
+            if unrestricted.get("top10_acc") is not None and block.get("top10_acc") is not None:
+                delta = block["top10_acc"] - unrestricted["top10_acc"]
+                _log(f"      vs unrestricted full-gallery top10={unrestricted.get('top10_acc')} (delta={delta:+.3f})")
 
         # Dual-side ("scan both sides") simulation -- the app's planned
         # feature. Fuses a front+back query pair into one combined
