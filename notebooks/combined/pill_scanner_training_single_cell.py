@@ -753,6 +753,62 @@ for row in manifest_rows:
     else:
         row["tier"] = "unknown"
 
+# Pool priority-tier NDC9 classes that share an identical, non-trivial
+# (imprint, shape, color) descriptor from RxNav's ndcproperties data --
+# these are near-certainly the same physical-looking pill sold under
+# different NDCs (different package size, or a genuinely identical product
+# from two labelers), not different-looking pills that happen to share a
+# drug name. Median images/class for priority-tier drugs has been ~1-2
+# across every trial so far; this multiplies effective images/class for
+# any group where it fires, using metadata already fetched in Section 2 --
+# no new data source needed. Conservative on purpose: imprint must be
+# >=2 characters and shape+color must both be present, or the NDC9 isn't
+# pooled at all (a short/common imprint like "5" could coincidentally
+# collide across genuinely different pills).
+def _build_visual_pool_remap():
+    from collections import defaultdict as _dd_pool
+    groups = _dd_pool(set)
+    for entries in drug_metadata.values():
+        for e in entries:
+            ndc = e.get("ndc")
+            imprint = (e.get("imprint") or "").strip().upper()
+            shape = (e.get("shape") or "").strip().upper()
+            color = (e.get("color") or "").strip().upper()
+            if not ndc or len(imprint) < 2 or not shape or not color:
+                continue
+            ndc9 = normalize_ndc9(ndc)
+            if ndc9 not in PRIORITY_NDC9_SET:
+                continue
+            groups[(imprint, shape, color)].add(ndc9)
+    remap = {}
+    n_merged_groups = 0
+    n_ndc9_pooled = 0
+    for ndc9_set in groups.values():
+        if len(ndc9_set) < 2:
+            continue
+        canonical = sorted(ndc9_set)[0]
+        for ndc9 in ndc9_set:
+            remap[ndc9] = canonical
+        n_merged_groups += 1
+        n_ndc9_pooled += len(ndc9_set)
+    return remap, n_merged_groups, n_ndc9_pooled
+
+_visual_pool_remap, _n_merged_groups, _n_ndc9_pooled = _build_visual_pool_remap()
+if _visual_pool_remap:
+    n_rows_remapped = 0
+    for row in manifest_rows:
+        if row["tier"] == "priority" and row["label"]:
+            canonical = _visual_pool_remap.get(normalize_ndc9(row["label"]))
+            if canonical and canonical != row["label"]:
+                row["label"] = canonical
+                n_rows_remapped += 1
+    print(f"Visual pooling: merged {_n_ndc9_pooled} NDC9 classes into {_n_merged_groups} "
+          f"visually-identical groups (identical imprint+shape+color) -- remapped "
+          f"{n_rows_remapped} image rows to their pooled class label.")
+else:
+    print("Visual pooling: no NDC9 groups shared a matching (imprint, shape, color) -- "
+          "nothing to pool this run.")
+
 print(f"Total images collected: {len(manifest_rows)}")
 by_source = Counter(r["source"] for r in manifest_rows)
 print("By source:", dict(by_source))
