@@ -1160,13 +1160,21 @@ def priority_label_lists(rows):
     return otc, rx
 
 # Of each proj_batch_p=12-class batch: guarantee this many are OTC-priority
-# and RX-priority classes specifically, leaving the rest (6/12) to uniform
-# sampling over all 95,665 classes so the broader embedding/retrieval
-# geometry doesn't collapse to priority-only. Weighted toward OTC (4 vs 2)
-# because it's the far weaker number (Trial 4: priority_OTC top5=23% vs
-# priority_RX top5=63%) and the explicit target for this trial.
+# and RX-priority classes specifically, leaving the rest (4/12) to uniform
+# sampling over all classes so the broader embedding/retrieval geometry
+# doesn't collapse to priority-only.
+#
+# Trial 5 (otc_quota=4, rx_quota=2) showed exactly why RX needs more than
+# 2: with ~2,819 RX-priority classes vs only ~132 OTC-priority classes in
+# that run, the SAME quota mechanism gave OTC classes ~24 draws/class/
+# epoch but RX classes only ~0.57 -- a 42.7x exposure gap purely from pool
+# size, not from RX being harder to fix. Consistent with the result:
+# priority_OTC jumped 23%->87% while priority_RX stayed flat at ~63%.
+# Doubling rx_quota (2->4) roughly doubles RX's per-class exposure; it
+# still won't match OTC's (RX's pool is ~20x bigger), but it's the
+# available lever without crowding out OTC or the general pool entirely.
 PK_OTC_QUOTA = 4
-PK_RX_QUOTA = 2
+PK_RX_QUOTA = 4
 
 # Bounded regardless of dataset size, and a hard wall-clock budget, so the
 # training loop always finishes and reaches export/gate rather than risking
