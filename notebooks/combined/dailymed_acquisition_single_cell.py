@@ -1,8 +1,11 @@
+# ============================================================================
+# DailyMed Acquisition — US RX+OTC pill images + metadata
+# ============================================================================
+
 
 # ============================================================================
 # 0. Setup
 # ============================================================================
-
 import json
 import re
 import shutil
@@ -30,22 +33,31 @@ STATE_PATH = WORK_DIR / "acquisition_state.json"
 print("Setup OK. Working directory:", WORK_DIR)
 
 
-
 # ============================================================================
 # 1. Scope + discover current zip URLs
 # ============================================================================
-
 SPL_RESOURCES_PAGE = "https://dailymed.nlm.nih.gov/dailymed/spl-resources-all-drug-labels.cfm"
 
 # Widened from the original conservative 2-OTC-part default: a real training
 # run showed only 6,728 OTC images total (vs. 188,464 RX) and just 9 test
 # rows landing in the priority_OTC tier -- nowhere near covering the top-500
 # OTC drugs. Fetch EVERY discovered OTC part (not a hardcoded count, since
-# DailyMed's part count has grown before) to close that gap; RX stays at its
-# already-fetched part(s) since RX coverage is already large. This is
-# resumable (state file below) so parts already downloaded/parsed in an
-# earlier run are skipped, not re-fetched.
-SPL_PARTS_TO_FETCH = None  # resolved below, after discovery, to "all OTC parts found"
+# DailyMed's part count has grown before) to close that gap.
+#
+# RX was originally left at just part1 ("RX coverage is not the current
+# gap") -- that assumption is now stale. The seed list grew from 150 to
+# 337 real RX drug names (ClinCalc-sourced), and Trial 6's real gate
+# numbers showed priority-tier images/class is thin on BOTH sides (median
+# ~2.8 images/class for the combined priority tier), not just OTC. A
+# single arbitrary RX part almost certainly doesn't cover many of the
+# newly-added, lower-prescription-volume drugs. Widened to fetch every
+# discovered RX part too, same as OTC -- this is real free data DailyMed
+# already has, not a new external source needed. The existing disk-safety
+# guard (MIN_FREE_DISK_BYTES, stop starting new parts below 2GB free)
+# means this fails safe (stops early) rather than crashing if the RX
+# corpus turns out too large for the session's disk, so widening carries
+# low risk even without knowing the exact part count/size in advance.
+SPL_PARTS_TO_FETCH = None  # resolved below, after discovery, to "all discovered RX + OTC parts"
 
 # Safety cap per part so one huge part can't silently run for many hours
 # unattended. None = no cap (process every document in the part).
@@ -70,10 +82,10 @@ spl_zip_urls = discover_spl_zip_urls()
 
 if SPL_PARTS_TO_FETCH is None:
     otc_parts_found = sorted(p for p in spl_zip_urls if p.startswith("human_otc_part"))
-    rx_parts_already_fetched = ["human_rx_part1"]  # keep RX at what's already fetched -- RX coverage is not the current gap
-    SPL_PARTS_TO_FETCH = otc_parts_found + [p for p in rx_parts_already_fetched if p in spl_zip_urls]
+    rx_parts_found = sorted(p for p in spl_zip_urls if p.startswith("human_rx_part"))
+    SPL_PARTS_TO_FETCH = otc_parts_found + rx_parts_found
     print(f"Resolved SPL_PARTS_TO_FETCH to all {len(otc_parts_found)} discovered OTC parts "
-          f"+ {len(rx_parts_already_fetched)} RX part(s): {SPL_PARTS_TO_FETCH}")
+          f"+ all {len(rx_parts_found)} discovered RX parts: {SPL_PARTS_TO_FETCH}")
 
 print(f"\nDiscovered {len(spl_zip_urls)} SPL zip URLs total:")
 for part, url in sorted(spl_zip_urls.items()):
@@ -85,11 +97,9 @@ if missing:
     print(f"\nWARNING: requested parts not found on the page: {missing}")
 
 
-
 # ============================================================================
 # 2. SPL parser (inlined — no external file dependency)
 # ============================================================================
-
 SPL_NS = {"v3": "urn:hl7-org:v3"}
 ORAL_SOLID_DOSAGE_FORM_CODES = {
     "C25158", "C42895", "C42896", "C42917", "C42902", "C42904", "C42916",
@@ -191,11 +201,9 @@ def parse_spl_bytes(xml_bytes, rx_or_otc):
 print("Parser defined.")
 
 
-
 # ============================================================================
 # 3. Download + process each part
 # ============================================================================
-
 import csv as _csv
 
 def load_state():
@@ -350,11 +358,9 @@ for part in SPL_PARTS_TO_FETCH:
 print("\nAll requested parts processed (or skipped/failed as logged above).")
 
 
-
 # ============================================================================
 # 4. Summary
 # ============================================================================
-
 if MANIFEST_PATH.exists():
     with open(MANIFEST_PATH) as f:
         rows = list(_csv.DictReader(f))
@@ -368,4 +374,3 @@ else:
 print("\nState:", json.load(open(STATE_PATH)) if STATE_PATH.exists() else "no state file")
 print("\nNext step: commit this notebook (Save & Run All), then in the training")
 print("notebook, Add Input -> Notebook -> this notebook, to read its output.")
-
