@@ -1216,21 +1216,26 @@ def priority_label_lists(rows):
     return otc, rx
 
 # Of each proj_batch_p=12-class batch: guarantee this many are OTC-priority
-# and RX-priority classes specifically, leaving the rest (4/12) to uniform
+# and RX-priority classes specifically, leaving the rest (2/12) to uniform
 # sampling over all classes so the broader embedding/retrieval geometry
-# doesn't collapse to priority-only.
+# against the full gate gallery doesn't collapse to priority-only.
 #
-# Trial 5 (otc_quota=4, rx_quota=2) showed exactly why RX needs more than
-# 2: with ~2,819 RX-priority classes vs only ~132 OTC-priority classes in
-# that run, the SAME quota mechanism gave OTC classes ~24 draws/class/
-# epoch but RX classes only ~0.57 -- a 42.7x exposure gap purely from pool
-# size, not from RX being harder to fix. Consistent with the result:
-# priority_OTC jumped 23%->87% while priority_RX stayed flat at ~63%.
-# Doubling rx_quota (2->4) roughly doubles RX's per-class exposure; it
-# still won't match OTC's (RX's pool is ~20x bigger), but it's the
-# available lever without crowding out OTC or the general pool entirely.
-PK_OTC_QUOTA = 4
-PK_RX_QUOTA = 4
+# Trial 5's 23%->87% OTC jump turned out to be an artifact of a confounded
+# (artificially small, ~132-class) OTC pool from the wrong DailyMed input,
+# not evidence the quota mechanism had "fixed" OTC. Trial 6 re-ran with
+# the correct full DailyMed data (~2,234 real OTC-priority classes, now
+# comparable in scale to RX's ~2,815) and priority_OTC came back down to
+# 24.9%/36.4% -- barely above the original no-oversampling baseline
+# (23%/33%). At true scale, otc_quota=4/rx_quota=4 gives only ~1.4 and
+# ~1.1 draws/class/epoch respectively -- both too diluted by pool size to
+# matter much, the same problem previously diagnosed for RX alone.
+# Bumped both further (4->5): still can't fully solve thousands-of-classes
+# dilution with a 12-slot batch, but it's more concentration without
+# dropping the general pool to zero, which the main (unrestricted-gallery)
+# gate still depends on for separating priority classes from the full
+# long-tail it's actually tested against.
+PK_OTC_QUOTA = 5
+PK_RX_QUOTA = 5
 
 # Bounded regardless of dataset size, and a hard wall-clock budget, so the
 # training loop always finishes and reaches export/gate rather than risking
