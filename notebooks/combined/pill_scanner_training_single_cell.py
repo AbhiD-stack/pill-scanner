@@ -689,6 +689,31 @@ _SPLIT_WRAPPER_NAMES = {
     "annotations",
 }
 
+# Brand-name folder -> real seeded generic drug, for folder-labeled
+# datasets whose class names are consumer brand names, not NDCs (e.g.
+# phvitamins_v2's "Capsure Dataset" folders). These datasets have real,
+# abundant photos (thousands of images for some brands) that currently
+# count toward NOTHING in the priority-tier goal, since they have no NDC
+# to resolve against PRIORITY_NDC9_SET -- tagged category="unknown" and
+# excluded from every RX/OTC accuracy number.
+#
+# ONLY includes mappings verified against this project's own seed list
+# data (an exact or common_brands-field match), not drug-brand knowledge
+# from memory -- a wrong brand=generic mapping would inject a genuinely
+# incorrect label into training data, worse than the missing coverage it
+# would "fix". Several other phvitamins_v2 folders (Biogesic, Tempra,
+# Bonamine, Rinityn, Flanax, Decolgen, Lactezin, etc.) are Philippine OTC
+# brands plausibly matching other seeded generics (e.g. acetaminophen,
+# meclizine, loratadine, naproxen sodium) but are NOT included here
+# pending manual verification -- add them to top_otc_seed.csv's
+# common_brands column (with a real source) once confirmed, and they'll
+# be picked up automatically next run.
+VERIFIED_BRAND_TO_GENERIC = {
+    "midol": "acetaminophen / caffeine / pyrilamine",
+    "omeprazole": "omeprazole",
+    "imodium": "loperamide",
+}
+
 def add_labeled_folder_dataset(key, label_prefix=None):
     """For classification-style datasets where each image's *immediate
     parent folder* is a real class/product name (ogyeiv2, phvitamins_v2,
@@ -696,31 +721,57 @@ def add_labeled_folder_dataset(key, label_prefix=None):
     folders sit directly at the dataset root, since real layouts vary (see
     _SPLIT_WRAPPER_NAMES above). Labels are raw folder names (prefixed by
     source), NOT US-NDC-mapped — visual/appearance diversity, not exact
-    NDC-level classes. A dataset whose images all sit under split/wrapper
-    folders with no real class-name level (e.g. a pure YOLO detection
-    layout with only train/images, train/labels — ogyeiv2's actual layout)
-    legitimately contributes 0 labeled rows here; that's correct, not a bug,
-    short of writing a YOLO-label parser to recover class names from
-    per-image .txt files instead of folder names.
+    NDC-level classes, EXCEPT for folder names matching
+    VERIFIED_BRAND_TO_GENERIC above, which get tagged as real priority-tier
+    OTC classes instead (own label namespace "BRAND:<generic>", kept
+    separate from NDC9-based labels rather than merged into an existing
+    NDC9 class -- these are real photos of a specific branded package, not
+    verified to visually match any particular NDC's imprint/color/shape,
+    so merging them into an existing sparse class risked contradictory
+    positive pairs; a new, image-rich class for that generic drug is safer
+    and still counts toward the priority-tier goal). A dataset whose
+    images all sit under split/wrapper folders with no real class-name
+    level (e.g. a pure YOLO detection layout with only train/images,
+    train/labels — ogyeiv2's actual layout) legitimately contributes 0
+    labeled rows here; that's correct, not a bug, short of writing a
+    YOLO-label parser to recover class names from per-image .txt files
+    instead of folder names.
     """
     root = dataset_roots.get(key)
     if not root:
         return
     prefix = label_prefix or key
     n_added = 0
+    n_brand_matched = 0
     for p in _find_images(root):
         class_name = p.parent.name
         if class_name.strip().lower() in _SPLIT_WRAPPER_NAMES:
             continue  # parent is a split/wrapper folder, not a real class name
-        manifest_rows.append({
-            "path": str(p),
-            "label": f"{prefix}:{class_name}",
-            "side": "unknown",
-            "domain": "reference_pool",
-            "source": key,
-            "category": "unknown",
-        })
+        generic = VERIFIED_BRAND_TO_GENERIC.get(class_name.strip().lower())
+        if generic:
+            manifest_rows.append({
+                "path": str(p),
+                "label": f"BRAND:{generic}",
+                "side": "unknown",
+                "domain": "reference_pool",
+                "source": key,
+                "category": "OTC",
+                "tier": "priority",
+            })
+            n_brand_matched += 1
+        else:
+            manifest_rows.append({
+                "path": str(p),
+                "label": f"{prefix}:{class_name}",
+                "side": "unknown",
+                "domain": "reference_pool",
+                "source": key,
+                "category": "unknown",
+            })
         n_added += 1
+    if n_brand_matched:
+        print(f"{key}: recovered {n_brand_matched} rows as verified priority-tier OTC "
+              f"via brand-name match ({sorted({c for c in VERIFIED_BRAND_TO_GENERIC})})")
     if n_added == 0:
         print(f"{key}: no images found with a real class-name parent folder "
               f"(only split/wrapper-named parents, or no images at all) — "
@@ -748,6 +799,11 @@ add_labeled_folder_dataset("drugs_vitamins_cls")
 # This is the split that actually matters for the doctor-testing goal —
 # reported separately, never blended into one overall number.
 for row in manifest_rows:
+    if "tier" in row:
+        continue  # already tagged explicitly (e.g. add_labeled_folder_dataset's
+        # verified brand-name matches) -- BRAND: labels aren't real NDCs, so
+        # running them through normalize_ndc9()/PRIORITY_NDC9_SET here would
+        # silently overwrite an already-correct "priority" with "long_tail".
     if row["category"] in ("RX", "OTC") and row["label"]:
         row["tier"] = "priority" if normalize_ndc9(row["label"]) in PRIORITY_NDC9_SET else "long_tail"
     else:
