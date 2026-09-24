@@ -20,7 +20,10 @@ from pathlib import Path
 import requests
 from PIL import Image
 
-MIN_FREE_DISK_BYTES = 2 * 1024**3  # stop starting new parts below 2GB free, rather than crash mid-part
+MIN_FREE_DISK_BYTES = 3 * 1024**3  # checked before every part AND on every
+# document within a part now (not just once per part) -- raised from 2GB to
+# 3GB for extra margin, since a full disk also broke Kaggle's own end-of-run
+# notebook/HTML export step, not just this script's own writes.
 
 WORK_DIR = Path("/kaggle/working")
 WORK_DIR.mkdir(exist_ok=True)
@@ -274,22 +277,53 @@ def download_to(url, dest_path, retries=3):
             time.sleep(wait)
     raise last_err
 
+FLUSH_EVERY_N_DOCS = 1000  # write accumulated rows/metadata to disk this often,
+# not once at the end of the whole part -- confirmed live: buffering an entire
+# RX part's rows/records in memory and writing them in one bulk append/dump at
+# the very end meant a disk-full error during that final write (or anywhere
+# after the last flush) lost the ENTIRE part's progress, not just "the last
+# bit". Flushing periodically bounds how much work a crash can lose to
+# FLUSH_EVERY_N_DOCS worth, not a whole part (RX parts can run ~9-15k docs).
+
 def process_part(part, url, rx_or_otc):
     print(f"\n=== {part} ===")
     tmp_zip_path = WORK_DIR / f"{part}.zip"
     print(f"downloading {url} ...")
     download_to(url, tmp_zip_path)
 
-    all_rows = []
-    all_records = []
+    buf_rows = []
+    buf_records = []
+    n_rows_total = 0
+    n_processed = 0
+    stopped_early = False
+
+    def _flush():
+        nonlocal buf_rows, buf_records
+        if buf_rows:
+            append_manifest_rows(buf_rows)
+        if buf_records:
+            merge_metadata(buf_records)
+        buf_rows, buf_records = [], []
+
     with zipfile.ZipFile(tmp_zip_path) as zf:
         doc_zip_names = [n for n in zf.namelist() if n.lower().endswith(".zip")]
         total = len(doc_zip_names) if MAX_DOCS_PER_PART is None else min(len(doc_zip_names), MAX_DOCS_PER_PART)
         print(f"  {len(doc_zip_names)} nested per-document zips found; processing {total}")
 
-        n_processed = 0
         for doc_zip_name in doc_zip_names:
             if MAX_DOCS_PER_PART and n_processed >= MAX_DOCS_PER_PART:
+                break
+            # Checked every doc (cheap: just an os.statvfs call), not just
+            # between parts -- a single RX part has been observed to consume
+            # 4-5GB while running, which a once-per-part check before starting
+            # can't catch; this is what actually crashed on human_rx_part3
+            # instead of stopping cleanly.
+            if _free_disk_bytes() < MIN_FREE_DISK_BYTES:
+                print(f"  Stopping mid-part after {n_processed}/{total} documents: "
+                      f"only {_free_disk_bytes() / 1024**3:.1f}GB free (below the "
+                      f"{MIN_FREE_DISK_BYTES / 1024**3:.0f}GB safety margin). "
+                      f"Flushing what's already processed before stopping.")
+                stopped_early = True
                 break
             try:
                 nested_bytes = zf.read(doc_zip_name)
@@ -309,9 +343,9 @@ def process_part(part, url, rx_or_otc):
                                     if not out_path.exists():
                                         _save_downscaled(nested_zf.read(matches[0]), out_path)
                                     local_paths.append(str(out_path))
-                            all_records.append(rec)
+                            buf_records.append(rec)
                             for path in local_paths:
-                                all_rows.append({
+                                buf_rows.append({
                                     "path": path, "label": rec.ndc, "side": "unknown",
                                     "domain": "reference_pool", "source": "dailymed",
                                     "category": rec.rx_or_otc,
@@ -319,15 +353,17 @@ def process_part(part, url, rx_or_otc):
             except Exception:
                 pass  # one bad nested zip/XML shouldn't kill the whole part
             n_processed += 1
-            if n_processed % 1000 == 0:
-                print(f"  ...{n_processed}/{total} processed, {len(all_rows)} images resolved so far")
+            if n_processed % FLUSH_EVERY_N_DOCS == 0:
+                n_rows_total += len(buf_rows)
+                _flush()
+                print(f"  ...{n_processed}/{total} processed, {n_rows_total} images resolved so far")
 
-    append_manifest_rows(all_rows)
-    merge_metadata(all_records)
+    n_rows_total += len(buf_rows)
+    _flush()
     tmp_zip_path.unlink(missing_ok=True)
-    print(f"  done: {n_processed} documents, {len(all_rows)} images resolved, "
-          f"{len(all_records)} pill records (metadata merged even without an image)")
-    return len(all_rows)
+    status = "stopped early (disk pressure)" if stopped_early else "done"
+    print(f"  {status}: {n_processed} documents, {n_rows_total} images resolved")
+    return n_rows_total, stopped_early
 
 state = load_state()
 for part in SPL_PARTS_TO_FETCH:
@@ -347,15 +383,30 @@ for part in SPL_PARTS_TO_FETCH:
         break
     rx_or_otc = "RX" if "rx" in part else "OTC"
     try:
-        process_part(part, spl_zip_urls[part], rx_or_otc)
-        state[part] = "done"
+        n_rows, stopped_early = process_part(part, spl_zip_urls[part], rx_or_otc)
+        state[part] = f"partial: stopped early on disk pressure ({n_rows} rows saved)" if stopped_early else "done"
     except Exception as e:
         print(f"FAILED on {part}: {e}")
         state[part] = f"failed: {e}"
+        stopped_early = False
     save_state(state)
     print(f"  free disk after {part}: {_free_disk_bytes() / 1024**3:.1f}GB")
+    if stopped_early:
+        # Whatever this part already flushed is safely on disk (process_part
+        # flushes incrementally, not in one bulk write) -- but disk is now
+        # critically low, so don't attempt the next part in the same session;
+        # stop the whole run cleanly here instead of limping into another
+        # mid-part crash. Re-running later re-attempts this same part from
+        # scratch (not marked "done"), which will re-download it -- images
+        # already on disk are skipped via the `if not out_path.exists()`
+        # check, so this doesn't re-do the expensive part, just re-parses the
+        # zip to pick up where the per-document disk check stopped it.
+        print(f"Stopping the whole run here (not attempting further parts) -- "
+              f"disk pressure hit mid-{part}, more parts would almost certainly "
+              f"hit the same wall immediately.")
+        break
 
-print("\nAll requested parts processed (or skipped/failed as logged above).")
+print("\nAll requested parts processed (or skipped/failed/stopped-early as logged above).")
 
 
 # ============================================================================
