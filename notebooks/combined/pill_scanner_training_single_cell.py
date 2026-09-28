@@ -2086,14 +2086,24 @@ def _rank_chunk(query_emb_n, gallery_emb_n, gallery_labels):
         out.append((ranked, float(top1_chunk[i])))
     return out
 
-def _rank_all_rows(rows, gallery_emb, gallery_labels, chunk_size=256):
+def _rank_all_rows(rows, gallery_emb, gallery_labels, chunk_size=64):
     """Ranks every row exactly once, normalizing the gallery exactly once --
     the naive per-axis approach (overall/domain/category/tier/
     tier_and_category/images_per_class/worst_classes = 7 axes) used to
     recompute this from scratch per axis, i.e. re-normalize the entire
     ~180k-image gallery up to 7x PER TEST ROW. At tens of thousands of test
     rows that's billions of wasted floating-point ops -- confirmed to
-    matter at this project's actual scale, not a micro-optimization."""
+    matter at this project's actual scale, not a micro-optimization.
+
+    chunk_size lowered 256 -> 64, and the normalized gallery/query copies
+    are explicitly freed before returning: the gallery has grown to ~380k+
+    rows (up from ~260k), and this function now runs multiple times per
+    gate (main gate, then again for dual-side) -- a run at this scale hit
+    a resource-exhaustion crash partway through the gate despite training/
+    export completing fine. Each chunk's argsort over the full gallery
+    width was allocating up to ~1GB of transient indices at chunk_size=256
+    against a 382k-row gallery, on top of a ~1.5GB gallery+normalized-copy
+    pair kept alive across calls -- this bounds both."""
     if not rows:
         return []
     gallery_emb_n = F.normalize(gallery_emb, dim=1)
@@ -2105,6 +2115,9 @@ def _rank_all_rows(rows, gallery_emb, gallery_labels, chunk_size=256):
             row = rows[start + local_i]
             correct = bool(ranked and ranked[0] == row.true_label)
             precomputed.append((ranked, top1_score, correct))
+    del gallery_emb_n, query_emb_n
+    import gc as _gc2
+    _gc2.collect()
     return precomputed
 
 def _accuracy_block(rows, rankings):

@@ -71,7 +71,7 @@ def _rank_chunk(
 
 
 def _rank_all_rows(
-    rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: list[str], chunk_size: int = 256
+    rows: list[QueryRow], gallery_emb: torch.Tensor, gallery_labels: list[str], chunk_size: int = 64
 ) -> list[tuple[list[str], float, bool]]:
     """Ranks every row exactly once (normalizing the gallery exactly once),
     instead of the naive approach of calling a per-row rank function once
@@ -81,7 +81,19 @@ def _rank_all_rows(
     to matter a lot at this scale: a ~180k-image gallery normalized ~7x per
     test row, for tens of thousands of test rows, is billions of wasted
     floating-point ops. Returns (ranked_labels, top1_score, top1_correct)
-    per row, reused by every axis below."""
+    per row, reused by every axis below.
+
+    chunk_size lowered 256 -> 64, and the normalized gallery/query copies are
+    explicitly freed before returning: confirmed the gallery has grown to
+    ~380k+ rows (up from ~260k), and this function now gets called multiple
+    times in one process for the same full gallery (the main gate, then
+    again for the dual-side simulation) -- each call's argsort over the
+    full gallery width allocates chunk_size x gallery_size int64 indices
+    (782MB at chunk_size=256 for a 382k gallery) on top of a ~1.5GB
+    original+normalized gallery pair that isn't otherwise released between
+    calls. A run at this scale hit "no space left on device" partway
+    through the gate despite training/export completing fine -- this is a
+    likely contributor, not the training loop itself."""
     if not rows:
         return []
     gallery_emb_n = F.normalize(gallery_emb, dim=1)
@@ -93,6 +105,9 @@ def _rank_all_rows(
             row = rows[start + local_i]
             correct = bool(ranked and ranked[0] == row.true_label)
             precomputed.append((ranked, top1_score, correct))
+    del gallery_emb_n, query_emb_n
+    import gc as _gc
+    _gc.collect()
     return precomputed
 
 
