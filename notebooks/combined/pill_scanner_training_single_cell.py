@@ -1488,6 +1488,34 @@ else:
           "If you meant to resume a previous session, attach that earlier committed "
           "version of THIS notebook as a Notebook input and re-run.")
 
+def find_prior_gallery():
+    """A prior run's deployed_ref_embeddings.pt is the FULL train+val
+    gallery (382k+ rows) already embedded through the backbone once --
+    the single most expensive and most crash-prone step in this whole
+    notebook (it's what the last two runs died on, right after training
+    finished). If a session already produced this and it's attached as
+    an input, there is zero reason to recompute it: reuse it verbatim."""
+    candidates = _glob.glob("/kaggle/input/**/deployed_ref_embeddings.pt", recursive=True)
+    return candidates[0] if candidates else None
+
+PRIOR_GALLERY_PATH = find_prior_gallery()
+
+# GATE_ONLY_MODE: when a prior checkpoint AND its already-computed gallery
+# are both attached, this session has nothing to gain from re-training or
+# re-embedding 382k+ images again -- that checkpoint already hit
+# val_top5=0.990, and re-embedding the gallery is the exact step that
+# crashed the last two multi-hour sessions right at the finish line,
+# wasting the entire GPU budget on a run whose real output (the gate
+# numbers) was never even reached. Skip straight to loading the existing
+# checkpoint + gallery and running ONLY the gate, so a crash there costs
+# ~1h of quota to diagnose, not ~9-10h. Set to False manually to force a
+# real training run even when both are attached.
+GATE_ONLY_MODE = bool(PRIOR_CHECKPOINT_PATH and PRIOR_GALLERY_PATH)
+if GATE_ONLY_MODE:
+    print(f"GATE_ONLY_MODE: found prior gallery at {PRIOR_GALLERY_PATH} alongside the "
+          f"checkpoint -- skipping training and gallery re-embedding entirely, running "
+          f"only the data pipeline + gate against the existing model.")
+
 
 def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_seconds=None):
     labels = sorted({r["label"] for r in train_rows})
@@ -1866,11 +1894,36 @@ PRIOR_LORA_ADAPTER_PATH = find_prior_lora_adapter()
 if PRIOR_LORA_ADAPTER_PATH:
     print(f"Found prior LoRA adapter to resume from: {PRIOR_LORA_ADAPTER_PATH}")
 
-try:
+if GATE_ONLY_MODE:
+    print(f"GATE_ONLY_MODE: loading head weights directly from {PRIOR_CHECKPOINT_PATH} "
+          f"(no training this session).", flush=True)
+    _ckpt = torch.load(PRIOR_CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+    label_list = _ckpt["label_classes"]
+    head = ProjectionHead(in_dim=_ckpt["in_dim"], hidden_dim=CFG["proj_hidden_dim"],
+                           out_dim=CFG["proj_embedding_dim"], num_classes=_ckpt["num_classes"]).to(DEVICE)
+    head.load_state_dict(_ckpt["head_state_dict"])
+    best_val_top5_reached = _ckpt.get("val_top5")
+    if PRIOR_LORA_ADAPTER_PATH:
+        from peft import PeftModel
+        _inner_backbone = backbone.module if isinstance(backbone, nn.DataParallel) else backbone
+        _peft_backbone = PeftModel.from_pretrained(_inner_backbone, PRIOR_LORA_ADAPTER_PATH, is_trainable=False)
+        _n_gpus = torch.cuda.device_count() if DEVICE.type == "cuda" else 0
+        backbone = nn.DataParallel(_peft_backbone).to(DEVICE) if _n_gpus > 1 else _peft_backbone.to(DEVICE)
+        print(f"GATE_ONLY_MODE: loaded LoRA adapter from {PRIOR_LORA_ADAPTER_PATH} "
+              f"(inference only, no gradients).", flush=True)
+    else:
+        print("GATE_ONLY_MODE: no LoRA adapter found alongside the checkpoint -- "
+              "evaluating with the frozen backbone + head only.", flush=True)
+    import gc as _gc0
+    _gc0.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+else:
+  try:
     head, label_list, best_val_top5_reached = train_projection_head(
         train_rows, val_rows, CFG, resume_from_path=PRIOR_CHECKPOINT_PATH,
         max_seconds=PROJ_PHASE_SECONDS)
-except Exception as e:
+  except Exception as e:
     # Last-resort fallback: if training itself crashes despite the
     # resampling/skip logic already in PillDataset/quick_val_top5, don't
     # lose the run -- load whichever checkpoint train_projection_head last
@@ -1904,7 +1957,10 @@ except Exception as e:
 # unvalidated code, and must never be able to lose the good Phase 1 result
 # above. On any failure here, print the traceback and keep going with
 # whatever Phase 1 already produced.
-if CFG.get("run_lora") and LORA_PHASE_SECONDS > 0 and LORA_PREFLIGHT_OK:
+if GATE_ONLY_MODE:
+    print("Skipping LoRA phase (GATE_ONLY_MODE already loaded the adapter for "
+          "inference above, if one was attached).", flush=True)
+elif CFG.get("run_lora") and LORA_PHASE_SECONDS > 0 and LORA_PREFLIGHT_OK:
     try:
         head, label_list, _lora_val_top5 = finetune_with_lora(
             head, label_list, train_rows, val_rows, CFG, LORA_PHASE_SECONDS,
@@ -2011,7 +2067,7 @@ def embed_rows(rows, head, label_list, batch_size=64):
     }, kept_rows
 
 
-def export_artifacts(head, label_list, gallery_rows, val_top5=None):
+def export_artifacts(head, label_list, gallery_rows, val_top5=None, prior_gallery_path=None):
     """Returns the gallery embeddings it computed -- the Section 10 gate
     needs the exact same train+val embeddings for its reference gallery,
     and re-embedding 180k+ images a second time from scratch would double
@@ -2023,7 +2079,15 @@ def export_artifacts(head, label_list, gallery_rows, val_top5=None):
     function never included it, so the next session's "carry forward the
     prior best score" logic always fell back to -1.0 (the field it was
     looking for never existed in the file actually being resumed from),
-    silently discarding the real prior score as the bar to beat."""
+    silently discarding the real prior score as the bar to beat.
+
+    prior_gallery_path (GATE_ONLY_MODE): reuse an already-computed gallery
+    instead of re-embedding gallery_rows -- this re-embedding of the full
+    382k+ train+val set is the single step that killed the last two
+    multi-hour sessions right after training finished (OOM a couple
+    thousand seconds after "Exported artifacts" would otherwise print).
+    Skipping it here is what makes a gate-only re-run actually safe to
+    attempt on a tight remaining GPU budget."""
     torch.save({
         "head_state_dict": head.state_dict(),
         "cfg": CFG,
@@ -2033,12 +2097,23 @@ def export_artifacts(head, label_list, gallery_rows, val_top5=None):
         "val_top5": val_top5,
     }, EXPORT_DIR / "best_projection_head.pt")
 
-    gallery, _ = embed_rows(gallery_rows, head, label_list)
+    if prior_gallery_path:
+        gallery = torch.load(prior_gallery_path, map_location="cpu", weights_only=False)
+        print(f"Reused prior gallery embeddings from {prior_gallery_path} "
+              f"({gallery['embeddings'].shape[0]} rows) -- skipped re-embedding.")
+    else:
+        gallery, _ = embed_rows(gallery_rows, head, label_list)
     torch.save(gallery, EXPORT_DIR / "deployed_ref_embeddings.pt")
     print(f"Exported artifacts to {EXPORT_DIR}")
     return gallery
 
-deployed_gallery = export_artifacts(head, label_list, train_rows + val_rows, val_top5=best_val_top5_reached)
+deployed_gallery = export_artifacts(
+    head, label_list, train_rows + val_rows, val_top5=best_val_top5_reached,
+    prior_gallery_path=PRIOR_GALLERY_PATH if GATE_ONLY_MODE else None)
+import gc as _gc1
+_gc1.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 
 # ============================================================================
@@ -2319,7 +2394,19 @@ try:
         # them here would just be a second multi-hour pass over the same
         # 180k+ images for an identical result.
         gallery = deployed_gallery
-        test_embedded, test_kept_rows = embed_rows(test_rows, head, label_list)
+        # batch_size dropped 64 -> 32 and explicit cleanup added right after:
+        # this exact call (embedding the ~45k held-out test images) is where
+        # the last two sessions died with an OOM kernel kill, a couple
+        # thousand seconds after training/export had already finished
+        # cleanly -- by this point in the run, RAM is already under real
+        # pressure from everything the data pipeline + training + the
+        # freshly-loaded/reused gallery are holding onto, so this pass gets
+        # the smallest safe batch size rather than reusing the default.
+        test_embedded, test_kept_rows = embed_rows(test_rows, head, label_list, batch_size=32)
+        import gc as _gc3
+        _gc3.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         query_rows = [
             QueryRow(embedding=emb, true_label=r["label"], domain=r["domain"],
                      side=r["side"], images_in_class=by_label_count[r["label"]],
