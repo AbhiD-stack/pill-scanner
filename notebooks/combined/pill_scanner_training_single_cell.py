@@ -2181,18 +2181,37 @@ def _rank_all_rows(rows, gallery_emb, gallery_labels, chunk_size=64):
     pair kept alive across calls -- this bounds both."""
     if not rows:
         return []
-    gallery_emb_n = F.normalize(gallery_emb, dim=1)
-    query_emb_n = F.normalize(torch.stack([r.embedding for r in rows]), dim=1)
+    # fp16 for the actual similarity/argsort math -- halves the size of the
+    # normalized gallery copy, the per-chunk similarity matrix, AND (since
+    # PyTorch's argsort scales its transient workspace with the input
+    # dtype too, not just the int64 output indices) the peak memory of
+    # the single most repeated operation in the whole gate. Embeddings
+    # are cosine-similarity ranked, not used for any precision-sensitive
+    # math, so fp16 costs no measurable accuracy here.
+    gallery_emb_n = F.normalize(gallery_emb, dim=1).half()
+    query_emb_n = F.normalize(torch.stack([r.embedding for r in rows]), dim=1).half()
     precomputed = []
-    for start in range(0, len(rows), chunk_size):
+    n_chunks = (len(rows) + chunk_size - 1) // chunk_size
+    for chunk_i, start in enumerate(range(0, len(rows), chunk_size)):
         chunk_result = _rank_chunk(query_emb_n[start:start + chunk_size], gallery_emb_n, gallery_labels)
         for local_i, (ranked, top1_score) in enumerate(chunk_result):
             row = rows[start + local_i]
             correct = bool(ranked and ranked[0] == row.true_label)
             precomputed.append((ranked, top1_score, correct))
+        # Print progress every ~10% of chunks, flushed immediately -- the
+        # last three runs all died silently somewhere in this exact loop
+        # with zero log output between "Exported artifacts" and the
+        # kernel death, so there was no way to tell how far any of them
+        # actually got. This is the one piece of information that matters
+        # most right now if it dies again.
+        if chunk_i % max(1, n_chunks // 10) == 0 or chunk_i == n_chunks - 1:
+            print(f"    _rank_all_rows: chunk {chunk_i+1}/{n_chunks} "
+                  f"({len(precomputed)}/{len(rows)} rows ranked)", flush=True)
     del gallery_emb_n, query_emb_n
     import gc as _gc2
     _gc2.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return precomputed
 
 def _accuracy_block(rows, rankings):
@@ -2221,36 +2240,51 @@ def _accuracy_block(rows, rankings):
     return result
 
 def evaluate(rows, gallery_emb, gallery_labels):
+    # Every one of the last 3 runs died silently somewhere after export
+    # with ZERO log lines in between (the _log() calls at the call site
+    # only start AFTER this whole function returns) -- so there was no
+    # way to tell whether the crash was in test embedding, in the ranking
+    # loop, or in one of these per-axis groupings. Print+flush after each
+    # one: cheap, and it's the difference between "still no idea" and
+    # "got past ranking, died grouping by X" on the next attempt.
+    print("  evaluate(): starting _rank_all_rows...", flush=True)
     report = {}
     rankings = _rank_all_rows(rows, gallery_emb, gallery_labels)
+    print(f"  evaluate(): ranking done ({len(rankings)} rows). Computing axis blocks...", flush=True)
 
     def _block_for(indices):
         return _accuracy_block([rows[i] for i in indices], [rankings[i] for i in indices])
 
     report["overall"] = _block_for(list(range(len(rows))))
+    print("  evaluate(): overall done.", flush=True)
     by_domain = _defaultdict(list)
     for i, r in enumerate(rows):
         by_domain[r.domain].append(i)
     report["by_domain"] = {d: _block_for(idxs) for d, idxs in by_domain.items()}
+    print("  evaluate(): by_domain done.", flush=True)
     by_category = _defaultdict(list)
     for i, r in enumerate(rows):
         by_category[r.category].append(i)
     report["by_category"] = {c: _block_for(idxs) for c, idxs in by_category.items()}
+    print("  evaluate(): by_category done.", flush=True)
     by_tier = _defaultdict(list)
     for i, r in enumerate(rows):
         by_tier[r.tier].append(i)
     report["by_tier"] = {t: _block_for(idxs) for t, idxs in by_tier.items()}
+    print("  evaluate(): by_tier done.", flush=True)
     # The actual granular goal numbers: top-500 RX and top-500 OTC as their
     # own distinct accuracies, not just tier and category reported separately.
     by_group = _defaultdict(list)
     for i, r in enumerate(rows):
         by_group[f"{r.tier}_{r.category}"].append(i)
     report["by_tier_and_category"] = {g: _block_for(idxs) for g, idxs in by_group.items()}
+    print("  evaluate(): by_tier_and_category done -- the real goal numbers are in report now.", flush=True)
     by_depth = _defaultdict(list)
     for i, r in enumerate(rows):
         bucket = "1-2" if r.images_in_class <= 2 else "3-5" if r.images_in_class <= 5 else "6+"
         by_depth[bucket].append(i)
     report["by_images_per_class"] = {b: _block_for(idxs) for b, idxs in by_depth.items()}
+    print("  evaluate(): by_images_per_class done.", flush=True)
     per_class = _defaultdict(list)
     for row, (ranked, _, _) in zip(rows, rankings):
         per_class[row.true_label].append(_topk_hit(row.true_label, ranked, 5))
@@ -2261,6 +2295,7 @@ def evaluate(rows, gallery_emb, gallery_labels):
     report["worst_classes_top5"] = [
         {"label": label, "top5_acc": round(acc, 3), "n_queries": n} for label, acc, n in worst
     ]
+    print("  evaluate(): worst_classes_top5 done. evaluate() complete.", flush=True)
     return report
 
 def restrict_gallery(gallery_emb, gallery_labels, keep_labels):
@@ -2403,6 +2438,7 @@ try:
         # freshly-loaded/reused gallery are holding onto, so this pass gets
         # the smallest safe batch size rather than reusing the default.
         test_embedded, test_kept_rows = embed_rows(test_rows, head, label_list, batch_size=32)
+        print(f"Test embedding done: {len(test_kept_rows)} rows.", flush=True)
         import gc as _gc3
         _gc3.collect()
         if torch.cuda.is_available():
@@ -2413,7 +2449,37 @@ try:
                      category=r["category"], tier=r.get("tier", "unknown"))
             for r, emb in zip(test_kept_rows, test_embedded["embeddings"])
         ]
-        report = evaluate(query_rows, gallery["embeddings"], [label_list[i] for i in gallery["label_indices"].tolist()])
+        gallery_labels_full = [label_list[i] for i in gallery["label_indices"].tolist()]
+
+        # Restricted-gallery deployment modes computed FIRST, before the
+        # full unrestricted evaluate() below -- this is the actual goal
+        # metric (top-500 RX/OTC accuracy), it ranks against a MUCH smaller
+        # gallery (priority-tier only, ~41k rows vs the full 382k), and
+        # every one of the last 3 runs died somewhere after export with
+        # zero real numbers recovered. Get the number that matters saved
+        # to disk first; the full multi-axis breakdown below is valuable
+        # but secondary, and its bigger gallery is the likelier crash risk.
+        print("Computing restricted-gallery deployment modes (priority-tier RX/OTC) first...", flush=True)
+        deploy_report = evaluate_deployment_modes(query_rows, gallery["embeddings"], gallery_labels_full)
+        json.dump(deploy_report, open(EXPORT_DIR / "deploy_report.json", "w"), indent=2, default=str)
+        _log("Restricted-gallery deployment modes (priority tier only -- the ask RX/OTC/don't-know app mode):")
+        pt = deploy_report.get("priority_tier_gallery", {})
+        _log(f"  priority_tier_gallery (gallery = priority-tier only, RX+OTC): "
+             f"n={pt.get('n')} top5={pt.get('top5_acc')} top10={pt.get('top10_acc')}")
+        for cat, block in deploy_report.get("priority_tier_gallery_by_category", {}).items():
+            _log(f"    {cat}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+        _log("  priority_tier_and_category_gallery (gallery = just that category's priority-tier classes):")
+        for cat, block in deploy_report.get("priority_tier_and_category_gallery", {}).items():
+            _log(f"    {cat}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+
+        # Full unrestricted multi-axis breakdown -- valuable diagnostics
+        # (worst classes, by-domain, by-images-per-class) but NOT the
+        # number that decides anything, and it ranks against the full
+        # 382k-row gallery 6 times over (7 axes, 1 shared ranking pass).
+        # If this crashes, deploy_report above is already safely on disk.
+        print("Computing full unrestricted gate (all axes, full gallery)...", flush=True)
+        report = evaluate(query_rows, gallery["embeddings"], gallery_labels_full)
+        report["deployment_modes"] = deploy_report
         json.dump(report, open(EXPORT_DIR / "eval_report.json", "w"), indent=2, default=str)
         consumer_top5 = report["by_domain"].get("consumer", {}).get("top5_acc")
         otc_top5 = report["by_category"].get("OTC", {}).get("top5_acc")
@@ -2427,65 +2493,54 @@ try:
         _log("By the 500 most common drugs, RX and OTC separately (the real goal numbers):")
         for group, block in sorted(report["by_tier_and_category"].items()):
             _log(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+            unrestricted_key = group
+            if group in ("priority_RX", "priority_OTC"):
+                cat = group.split("_", 1)[1]
+                dm_block = deploy_report.get("priority_tier_and_category_gallery", {}).get(cat, {})
+                if dm_block.get("top10_acc") is not None and block.get("top10_acc") is not None:
+                    delta = dm_block["top10_acc"] - block["top10_acc"]
+                    _log(f"      restricted-gallery top10={dm_block.get('top10_acc')} (delta vs unrestricted={delta:+.3f})")
         _log("Worst 10 classes by top5 accuracy:")
         for w in report["worst_classes_top5"][:10]:
             _log(f"  {w['label']}: top5={w['top5_acc']} (n={w['n_queries']})")
 
-        # Restricted-gallery deployment modes -- "common drugs only" and
-        # "common drugs + known RX/OTC" search spaces, tested against the
-        # SAME embeddings already computed above (no new training needed).
-        # Priority-tier queries currently compete against tens of thousands
-        # of long-tail classes in the unrestricted gallery; this measures
-        # what accuracy looks like in an app mode that deliberately narrows
-        # the search space instead. See evaluate_deployment_modes() above.
-        deploy_report = evaluate_deployment_modes(query_rows, gallery["embeddings"],
-                                                    [label_list[i] for i in gallery["label_indices"].tolist()])
-        report["deployment_modes"] = deploy_report
-        _log("\nRestricted-gallery deployment modes (same embeddings, smaller search space):")
-        pt = deploy_report.get("priority_tier_gallery", {})
-        _log(f"  priority_tier_gallery (gallery = priority-tier only, RX+OTC): "
-             f"n={pt.get('n')} top5={pt.get('top5_acc')} top10={pt.get('top10_acc')}")
-        for cat, block in deploy_report.get("priority_tier_gallery_by_category", {}).items():
-            _log(f"    {cat}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
-        _log("  priority_tier_and_category_gallery (gallery = just that category's priority-tier classes):")
-        for cat, block in deploy_report.get("priority_tier_and_category_gallery", {}).items():
-            _log(f"    {cat}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
-            unrestricted = report["by_tier_and_category"].get(f"priority_{cat}", {})
-            if unrestricted.get("top10_acc") is not None and block.get("top10_acc") is not None:
-                delta = block["top10_acc"] - unrestricted["top10_acc"]
-                _log(f"      vs unrestricted full-gallery top10={unrestricted.get('top10_acc')} (delta={delta:+.3f})")
-
-        # Dual-side ("scan both sides") simulation -- the app's planned
-        # feature. Fuses a front+back query pair into one combined
-        # embedding instead of single-image-only evaluation. RX and OTC
-        # are reported separately and given equal weight here -- OTC now
-        # has real (if heuristic) front/back coverage via add_dailymed()'s
-        # document-order recovery, not left for "later."
-        dual_rows = build_dual_side_query_rows(query_rows)
-        _log(f"\nDual-side (scan-both-sides) simulation: {len(dual_rows)} fused query pairs "
-             f"across {len({r.true_label for r in dual_rows})} distinct classes with real "
-             f"front+back data available.")
-        if dual_rows:
-            dual_report = evaluate(dual_rows, gallery["embeddings"],
-                                    [label_list[i] for i in gallery["label_indices"].tolist()])
-            _log(f"  overall: n={dual_report['overall'].get('n')} "
-                 f"top5={dual_report['overall'].get('top5_acc')} top10={dual_report['overall'].get('top10_acc')}")
-            for group, block in sorted(dual_report.get("by_tier_and_category", {}).items()):
-                _log(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
-            for cat in ("RX", "OTC"):
-                single_n = report["by_category"].get(cat, {}).get("n", 0)
-                single_acc = report["by_category"].get(cat, {}).get("top5_acc")
-                dual_n = dual_report["by_category"].get(cat, {}).get("n", 0)
-                dual_acc = dual_report["by_category"].get(cat, {}).get("top5_acc")
-                if single_acc is not None and dual_acc is not None:
-                    _log(f"  {cat} single-image top5={single_acc} (n={single_n}) vs "
-                         f"{cat} dual-side top5={dual_acc} (n={dual_n}) "
-                         f"(delta={dual_acc - single_acc:+.3f})")
-                else:
-                    _log(f"  {cat}: no dual-side pairs available yet (n={dual_n})")
+        # Dual-side ("scan both sides") simulation -- disabled for this
+        # run. It's a real feature we want data on eventually, but it's
+        # ANOTHER full-gallery rerank pass stacked after two others above,
+        # and with only ~7h of GPU quota left after 3 straight crashes,
+        # getting the priority-tier and full-gate numbers onto disk
+        # safely matters more right now than this one. Flip back to True
+        # once a run completes cleanly through the point above.
+        RUN_DUAL_SIDE_SIM = False
+        if RUN_DUAL_SIDE_SIM:
+            dual_rows = build_dual_side_query_rows(query_rows)
+            _log(f"\nDual-side (scan-both-sides) simulation: {len(dual_rows)} fused query pairs "
+                 f"across {len({r.true_label for r in dual_rows})} distinct classes with real "
+                 f"front+back data available.")
+            if dual_rows:
+                dual_report = evaluate(dual_rows, gallery["embeddings"], gallery_labels_full)
+                _log(f"  overall: n={dual_report['overall'].get('n')} "
+                     f"top5={dual_report['overall'].get('top5_acc')} top10={dual_report['overall'].get('top10_acc')}")
+                for group, block in sorted(dual_report.get("by_tier_and_category", {}).items()):
+                    _log(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+                for cat in ("RX", "OTC"):
+                    single_n = report["by_category"].get(cat, {}).get("n", 0)
+                    single_acc = report["by_category"].get(cat, {}).get("top5_acc")
+                    dual_n = dual_report["by_category"].get(cat, {}).get("n", 0)
+                    dual_acc = dual_report["by_category"].get(cat, {}).get("top5_acc")
+                    if single_acc is not None and dual_acc is not None:
+                        _log(f"  {cat} single-image top5={single_acc} (n={single_n}) vs "
+                             f"{cat} dual-side top5={dual_acc} (n={dual_n}) "
+                             f"(delta={dual_acc - single_acc:+.3f})")
+                    else:
+                        _log(f"  {cat}: no dual-side pairs available yet (n={dual_n})")
+            else:
+                _log("  No classes had both a front-tagged and back-tagged query row -- "
+                     "dual-side accuracy is unmeasured, not zero.")
         else:
-            _log("  No classes had both a front-tagged and back-tagged query row -- "
-                 "dual-side accuracy is unmeasured, not zero.")
+            _log("\nDual-side simulation skipped this run (RUN_DUAL_SIDE_SIM=False) -- "
+                 "prioritizing getting the core gate numbers safely to disk given limited "
+                 "remaining GPU quota. Re-enable once a run completes cleanly.")
 
         # Three real outcomes, not two -- printing "GATE FAILED" when there's
         # simply no consumer-domain data YET to check (a known, expected gap,
