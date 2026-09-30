@@ -2146,6 +2146,20 @@ def _rank_chunk(query_emb_n, gallery_emb_n, gallery_labels):
     matmul. Chunked (not the whole query set at once) to keep memory
     bounded against a 180k+-image gallery -- a single (n_queries x
     gallery_size) similarity matrix at that scale would be tens of GB."""
+    # THE actual memory bomb, found from real evidence (per-chunk time
+    # creeping up over the full-gallery pass, restricted-gallery passes
+    # finishing instantly, death at chunk 281/706): this used to walk the
+    # ENTIRE sorted gallery order (up to 382k indices) building a fully
+    # deduped ranked list of every unique label in the gallery -- against
+    # the full gallery that's up to ~138,389 labels PER QUERY ROW, and
+    # _rank_all_rows keeps every row's list alive simultaneously (needed
+    # later for the by-domain/by-category groupings). Restricted-gallery
+    # calls only ever had ~2.8k-9.3k unique labels to begin with, which is
+    # exactly why only the full-gallery pass grew and died. TOPKS maxes
+    # out at 50 -- nothing downstream ever looks past ranked[:50], so stop
+    # collecting once MAX_RANKED unique labels are found instead of
+    # walking the rest of a 382k-wide sorted order for nothing.
+    MAX_RANKED = max(TOPKS) + 10  # headroom above 50, still ~13,830x smaller than 138k
     sims_chunk = query_emb_n @ gallery_emb_n.T
     order_chunk = torch.argsort(sims_chunk, dim=1, descending=True)
     top1_chunk = sims_chunk.max(dim=1).values
@@ -2158,6 +2172,8 @@ def _rank_chunk(query_emb_n, gallery_emb_n, gallery_labels):
             if lbl not in seen:
                 seen.add(lbl)
                 ranked.append(lbl)
+                if len(ranked) >= MAX_RANKED:
+                    break
         out.append((ranked, float(top1_chunk[i])))
     return out
 
