@@ -1290,8 +1290,15 @@ def priority_label_lists(rows):
 # dropping the general pool to zero, which the main (unrestricted-gallery)
 # gate still depends on for separating priority classes from the full
 # long-tail it's actually tested against.
-PK_OTC_QUOTA = 5
-PK_RX_QUOTA = 5
+# Rebalanced 5/5 -> 4/7 based on the first completed real gate: priority-
+# tier RX (9306 classes) got the same 5-of-12 quota as priority-tier OTC
+# (2816 classes), so each individual RX class was sampled ~3.3x less often
+# per epoch than each OTC class -- a real, measured exposure gap, not a
+# guess. Real gate evidence: restricted-gallery top10 was 88.2% OTC vs
+# 65.6% RX. OTC quota cut from 5->4 (not to zero) to keep it reasonably
+# fed rather than risk regressing an already-strong, goal-exceeding number.
+PK_OTC_QUOTA = 4
+PK_RX_QUOTA = 7
 
 # Bounded regardless of dataset size, and a hard wall-clock budget, so the
 # training loop always finishes and reaches export/gate rather than risking
@@ -1319,7 +1326,15 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # 2.31h fixed, regardless of training time. Planning for 2.4h (slight
 # margin above observed) leaves 6.9h for training; using 6.5h keeps a
 # real ~35min buffer under the 9.5h ceiling rather than running at the edge.
-MAX_TRAIN_SECONDS = int(6.5 * 3600)
+# Cut way down from 6.5h for this specific session: only ~5h of GPU quota
+# is left total (not per-session), and retraining (unlike the gate-only
+# runs) MUST re-embed the full 382k-row gallery afterward since the weights
+# change -- that alone costs ~1.6h based on the last real training run's
+# timing, on top of ~45min data pipeline + ~15min test-embed/deploy-modes
+# gate (full unrestricted gate skipped this run, see RUN_FULL_UNRESTRICTED_GATE
+# below). Fixed overhead alone is ~2.6h; budgeting 2h for training here
+# leaves a real ~20-25min buffer inside the 5h instead of running at the edge.
+MAX_TRAIN_SECONDS = int(2.0 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 100     # cheap periodic validation for best-checkpoint selection -- tightened from 200 so the last checkpoint before a time-budget stop is never more than ~100 batches stale
 
@@ -1500,6 +1515,16 @@ def find_prior_gallery():
 
 PRIOR_GALLERY_PATH = find_prior_gallery()
 
+# FORCE_RETRAIN_THIS_SESSION: the real gate (finally completed clean) showed
+# RX (top10=65.6% restricted-gallery) meaningfully behind OTC (top10=88.2%),
+# with a real, measured cause -- the priority-tier pool has 9306 RX classes
+# vs 2816 OTC classes, but PK_RX_QUOTA/PK_OTC_QUOTA were equal (5/5), so
+# each individual RX class was getting sampled ~3.3x less often than each
+# OTC class. This session deliberately retrains with the quota rebalanced
+# toward RX (see PK_RX_QUOTA/PK_OTC_QUOTA below) -- set back to False to
+# return to the fast gate-only path once this experiment is evaluated.
+FORCE_RETRAIN_THIS_SESSION = True
+
 # GATE_ONLY_MODE: when a prior checkpoint AND its already-computed gallery
 # are both attached, this session has nothing to gain from re-training or
 # re-embedding 382k+ images again -- that checkpoint already hit
@@ -1510,11 +1535,15 @@ PRIOR_GALLERY_PATH = find_prior_gallery()
 # checkpoint + gallery and running ONLY the gate, so a crash there costs
 # ~1h of quota to diagnose, not ~9-10h. Set to False manually to force a
 # real training run even when both are attached.
-GATE_ONLY_MODE = bool(PRIOR_CHECKPOINT_PATH and PRIOR_GALLERY_PATH)
+GATE_ONLY_MODE = bool(PRIOR_CHECKPOINT_PATH and PRIOR_GALLERY_PATH) and not FORCE_RETRAIN_THIS_SESSION
 if GATE_ONLY_MODE:
     print(f"GATE_ONLY_MODE: found prior gallery at {PRIOR_GALLERY_PATH} alongside the "
           f"checkpoint -- skipping training and gallery re-embedding entirely, running "
           f"only the data pipeline + gate against the existing model.")
+elif FORCE_RETRAIN_THIS_SESSION and PRIOR_CHECKPOINT_PATH:
+    print("FORCE_RETRAIN_THIS_SESSION=True: retraining this session (RX quota rebalance "
+          "experiment) even though a prior gallery is attached -- the gallery will be "
+          "re-embedded with the new weights after training, not reused.")
 
 
 def train_projection_head(train_rows, val_rows, cfg, resume_from_path=None, max_seconds=None):
@@ -1878,9 +1907,13 @@ print("=" * 60, flush=True)
 # but the sampler itself just changed (OTC/RX-priority classes are now
 # heavily oversampled) -- give it 1.5h to re-stabilize under that new
 # distribution before switching to LoRA, rather than assuming the old
-# plateau still applies unchanged. With 30h of quota available again,
-# there's room for this without starving LoRA (still gets 5h).
-PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# plateau still applies unchanged. That logic doesn't apply this session:
+# only ~2h total is budgeted (see MAX_TRAIN_SECONDS above), the head is
+# already resumed from a checkpoint that hit val_top5=0.990, and the
+# entire point of this run is the LoRA phase under the rebalanced RX/OTC
+# quota -- so head-only gets just enough time for a couple of quick-val
+# checks to confirm the resume worked, and LoRA gets the rest.
+PROJ_PHASE_SECONDS = 300 if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
@@ -2490,35 +2523,55 @@ try:
 
         # Full unrestricted multi-axis breakdown -- valuable diagnostics
         # (worst classes, by-domain, by-images-per-class) but NOT the
-        # number that decides anything, and it ranks against the full
-        # 382k-row gallery 6 times over (7 axes, 1 shared ranking pass).
-        # If this crashes, deploy_report above is already safely on disk.
-        print("Computing full unrestricted gate (all axes, full gallery)...", flush=True)
-        report = evaluate(query_rows, gallery["embeddings"], gallery_labels_full)
-        report["deployment_modes"] = deploy_report
-        json.dump(report, open(EXPORT_DIR / "eval_report.json", "w"), indent=2, default=str)
-        consumer_top5 = report["by_domain"].get("consumer", {}).get("top5_acc")
-        otc_top5 = report["by_category"].get("OTC", {}).get("top5_acc")
-        priority_top5 = report["by_tier"].get("priority", {}).get("top5_acc")
-        priority_top10 = report["by_tier"].get("priority", {}).get("top10_acc")
-        _log(f"OVERALL: n={report['overall'].get('n')} top1={report['overall'].get('top1_acc')} "
-             f"top5={report['overall'].get('top5_acc')} top10={report['overall'].get('top10_acc')}")
-        _log(f"consumer-domain top5: {consumer_top5} | OTC-category top5: {otc_top5}")
-        _log(f"PRIORITY TIER (top-500 RX/OTC -- the actual doctor-testing goal): "
-             f"top5={priority_top5} top10={priority_top10}")
-        _log("By the 500 most common drugs, RX and OTC separately (the real goal numbers):")
-        for group, block in sorted(report["by_tier_and_category"].items()):
-            _log(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
-            unrestricted_key = group
-            if group in ("priority_RX", "priority_OTC"):
-                cat = group.split("_", 1)[1]
-                dm_block = deploy_report.get("priority_tier_and_category_gallery", {}).get(cat, {})
-                if dm_block.get("top10_acc") is not None and block.get("top10_acc") is not None:
-                    delta = dm_block["top10_acc"] - block["top10_acc"]
-                    _log(f"      restricted-gallery top10={dm_block.get('top10_acc')} (delta vs unrestricted={delta:+.3f})")
-        _log("Worst 10 classes by top5 accuracy:")
-        for w in report["worst_classes_top5"][:10]:
-            _log(f"  {w['label']}: top5={w['top5_acc']} (n={w['n_queries']})")
+        # number that decides anything (the restricted-gallery deploy_report
+        # above IS the number the app actually uses), and it ranks against
+        # the full 382k-row gallery. Skipped this session (~35min saved,
+        # per the last completed run's timing) to put more of the tight
+        # 5h GPU budget into the RX-quota-rebalance training itself. Flip
+        # back to True once the training experiment is done and there's
+        # budget to spare for the full diagnostic breakdown again.
+        RUN_FULL_UNRESTRICTED_GATE = False
+        if RUN_FULL_UNRESTRICTED_GATE:
+            print("Computing full unrestricted gate (all axes, full gallery)...", flush=True)
+            report = evaluate(query_rows, gallery["embeddings"], gallery_labels_full)
+            report["deployment_modes"] = deploy_report
+            json.dump(report, open(EXPORT_DIR / "eval_report.json", "w"), indent=2, default=str)
+            consumer_top5 = report["by_domain"].get("consumer", {}).get("top5_acc")
+            otc_top5 = report["by_category"].get("OTC", {}).get("top5_acc")
+            priority_top5 = report["by_tier"].get("priority", {}).get("top5_acc")
+            priority_top10 = report["by_tier"].get("priority", {}).get("top10_acc")
+            _log(f"OVERALL: n={report['overall'].get('n')} top1={report['overall'].get('top1_acc')} "
+                 f"top5={report['overall'].get('top5_acc')} top10={report['overall'].get('top10_acc')}")
+            _log(f"consumer-domain top5: {consumer_top5} | OTC-category top5: {otc_top5}")
+            _log(f"PRIORITY TIER (top-500 RX/OTC -- the actual doctor-testing goal): "
+                 f"top5={priority_top5} top10={priority_top10}")
+            _log("By the 500 most common drugs, RX and OTC separately (the real goal numbers):")
+            for group, block in sorted(report["by_tier_and_category"].items()):
+                _log(f"  {group}: n={block.get('n')} top5={block.get('top5_acc')} top10={block.get('top10_acc')}")
+                if group in ("priority_RX", "priority_OTC"):
+                    cat = group.split("_", 1)[1]
+                    dm_block = deploy_report.get("priority_tier_and_category_gallery", {}).get(cat, {})
+                    if dm_block.get("top10_acc") is not None and block.get("top10_acc") is not None:
+                        delta = dm_block["top10_acc"] - block["top10_acc"]
+                        _log(f"      restricted-gallery top10={dm_block.get('top10_acc')} (delta vs unrestricted={delta:+.3f})")
+            _log("Worst 10 classes by top5 accuracy:")
+            for w in report["worst_classes_top5"][:10]:
+                _log(f"  {w['label']}: top5={w['top5_acc']} (n={w['n_queries']})")
+        else:
+            # Derive the goal-check numbers from the restricted-gallery
+            # report instead (that's the number that actually ships, per
+            # the "ask RX/OTC/don't know" app feature), and skip the
+            # consumer-domain / worst-classes diagnostics this run.
+            report = {"deployment_modes": deploy_report}
+            json.dump(report, open(EXPORT_DIR / "eval_report.json", "w"), indent=2, default=str)
+            consumer_top5 = None
+            pt = deploy_report.get("priority_tier_gallery", {})
+            priority_top5 = pt.get("top5_acc")
+            priority_top10 = pt.get("top10_acc")
+            otc_top5 = deploy_report.get("priority_tier_and_category_gallery", {}).get("OTC", {}).get("top5_acc")
+            _log("Full unrestricted gate skipped this run (RUN_FULL_UNRESTRICTED_GATE=False) -- "
+                 "goal-check numbers below are from the restricted-gallery deploy_report above, "
+                 "which is what the app actually ships.")
 
         # Dual-side ("scan both sides") simulation -- disabled for this
         # run. It's a real feature we want data on eventually, but it's
