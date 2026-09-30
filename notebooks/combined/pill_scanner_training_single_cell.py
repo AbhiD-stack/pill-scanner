@@ -1326,15 +1326,14 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # 2.31h fixed, regardless of training time. Planning for 2.4h (slight
 # margin above observed) leaves 6.9h for training; using 6.5h keeps a
 # real ~35min buffer under the 9.5h ceiling rather than running at the edge.
-# Cut way down from 6.5h for this specific session: only ~5h of GPU quota
-# is left total (not per-session), and retraining (unlike the gate-only
-# runs) MUST re-embed the full 382k-row gallery afterward since the weights
-# change -- that alone costs ~1.6h based on the last real training run's
-# timing, on top of ~45min data pipeline + ~15min test-embed/deploy-modes
-# gate (full unrestricted gate skipped this run, see RUN_FULL_UNRESTRICTED_GATE
-# below). Fixed overhead alone is ~2.6h; budgeting 2h for training here
-# leaves a real ~20-25min buffer inside the 5h instead of running at the edge.
-MAX_TRAIN_SECONDS = int(2.0 * 3600)
+# Running on the 30h-quota account for this RX-rebalance experiment, not
+# the ~5h-remaining one -- Kaggle's single-session ceiling (~9.5h) is the
+# binding constraint again, not remaining quota. Fixed overhead (pipeline
+# ~45min + mandatory gallery re-embed ~1.6h since retraining changes the
+# weights + test-embed/deploy-modes gate ~15min + the full unrestricted
+# gate re-enabled below ~35min) is ~3.25h, leaving ~6h for training with
+# a real buffer under the session ceiling.
+MAX_TRAIN_SECONDS = int(6.0 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 100     # cheap periodic validation for best-checkpoint selection -- tightened from 200 so the last checkpoint before a time-budget stop is never more than ~100 batches stale
 
@@ -1907,13 +1906,11 @@ print("=" * 60, flush=True)
 # but the sampler itself just changed (OTC/RX-priority classes are now
 # heavily oversampled) -- give it 1.5h to re-stabilize under that new
 # distribution before switching to LoRA, rather than assuming the old
-# plateau still applies unchanged. That logic doesn't apply this session:
-# only ~2h total is budgeted (see MAX_TRAIN_SECONDS above), the head is
-# already resumed from a checkpoint that hit val_top5=0.990, and the
-# entire point of this run is the LoRA phase under the rebalanced RX/OTC
-# quota -- so head-only gets just enough time for a couple of quick-val
-# checks to confirm the resume worked, and LoRA gets the rest.
-PROJ_PHASE_SECONDS = 300 if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# plateau still applies unchanged. Same reasoning applies again here: the
+# quota just changed a second time (5/5 -> 4/7), so give head-only 1.5h to
+# re-stabilize under the new RX-weighted distribution before LoRA -- now
+# affordable again with 6h total budgeted on the 30h-quota account.
+PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
@@ -2524,13 +2521,10 @@ try:
         # Full unrestricted multi-axis breakdown -- valuable diagnostics
         # (worst classes, by-domain, by-images-per-class) but NOT the
         # number that decides anything (the restricted-gallery deploy_report
-        # above IS the number the app actually uses), and it ranks against
-        # the full 382k-row gallery. Skipped this session (~35min saved,
-        # per the last completed run's timing) to put more of the tight
-        # 5h GPU budget into the RX-quota-rebalance training itself. Flip
-        # back to True once the training experiment is done and there's
-        # budget to spare for the full diagnostic breakdown again.
-        RUN_FULL_UNRESTRICTED_GATE = False
+        # above IS the number the app actually uses). Re-enabled now that
+        # this is running on the 30h-quota account with real budget to
+        # spare (~35min), not the ~5h-remaining account this was cut for.
+        RUN_FULL_UNRESTRICTED_GATE = True
         if RUN_FULL_UNRESTRICTED_GATE:
             print("Computing full unrestricted gate (all axes, full gallery)...", flush=True)
             report = evaluate(query_rows, gallery["embeddings"], gallery_labels_full)
