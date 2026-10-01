@@ -851,16 +851,30 @@ def _build_visual_pool_remap():
                 _diag["has_color"] += 1
             if len(_sample_entries) < 5 and ndc:
                 _sample_entries.append({"ndc": ndc, "imprint": imprint, "shape": shape, "color": color})
-            if not ndc or len(imprint) < 2 or not shape or not color:
+            # shape (SPLSHAPE) was confirmed EMPTY for all 21318 resolved NDC
+            # entries on a real run (has_shape: 0) while imprint and color
+            # were both well-populated (~10k/~12k) -- RxNav's ndcproperties
+            # endpoint simply doesn't return shape for this seed list, not a
+            # normalization bug in this code. Requiring it made the filter
+            # unsatisfiable 100% of the time regardless of real duplicates.
+            # Matching on (imprint, color) alone is a reasonable fallback:
+            # it's still a 2-field opaque-but-consistent key, and color
+            # genuinely does vary by strength within the same manufacturer
+            # (different-dose variants are deliberately colored differently
+            # in practice), so it still guards against merging genuinely
+            # different-strength products that happen to share an imprint.
+            if not ndc or len(imprint) < 2 or not color:
                 continue
             _diag["passes_all_filters"] += 1
             ndc9 = normalize_ndc9(ndc)
             if ndc9 not in PRIORITY_NDC9_SET:
                 continue
             _diag["in_priority_set"] += 1
-            groups[(imprint, shape, color)].add(ndc9)
+            groups[(imprint, color)].add(ndc9)
     print(f"Visual pooling diagnostics: {_diag}")
     print(f"Visual pooling sample entries (first 5 with a non-empty ndc): {_sample_entries}")
+    print("Visual pooling: matching on (imprint, color) only -- shape (SPLSHAPE) is "
+          "confirmed empty for this seed list from RxNav, not a normalization bug.")
     remap = {}
     n_merged_groups = 0
     n_ndc9_pooled = 0
