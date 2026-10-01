@@ -824,18 +824,43 @@ for row in manifest_rows:
 def _build_visual_pool_remap():
     from collections import defaultdict as _dd_pool
     groups = _dd_pool(set)
+    # Diagnostic counters: every run so far has reported ZERO pooled groups
+    # across 9306+2816 priority NDC9 classes, which is suspicious -- generic
+    # RX drugs very often DO share identical imprint/shape/color across
+    # manufacturers. This tells us WHICH filter is actually killing every
+    # candidate (RxNav genuinely missing the data vs. a normalization bug
+    # in this code) instead of continuing to guess.
+    _diag = {"total_entries": 0, "has_ndc": 0, "has_imprint_2plus": 0,
+             "has_shape": 0, "has_color": 0, "passes_all_filters": 0,
+             "in_priority_set": 0}
+    _sample_entries = []
     for entries in drug_metadata.values():
         for e in entries:
+            _diag["total_entries"] += 1
             ndc = e.get("ndc")
             imprint = (e.get("imprint") or "").strip().upper()
             shape = (e.get("shape") or "").strip().upper()
             color = (e.get("color") or "").strip().upper()
+            if ndc:
+                _diag["has_ndc"] += 1
+            if len(imprint) >= 2:
+                _diag["has_imprint_2plus"] += 1
+            if shape:
+                _diag["has_shape"] += 1
+            if color:
+                _diag["has_color"] += 1
+            if len(_sample_entries) < 5 and ndc:
+                _sample_entries.append({"ndc": ndc, "imprint": imprint, "shape": shape, "color": color})
             if not ndc or len(imprint) < 2 or not shape or not color:
                 continue
+            _diag["passes_all_filters"] += 1
             ndc9 = normalize_ndc9(ndc)
             if ndc9 not in PRIORITY_NDC9_SET:
                 continue
+            _diag["in_priority_set"] += 1
             groups[(imprint, shape, color)].add(ndc9)
+    print(f"Visual pooling diagnostics: {_diag}")
+    print(f"Visual pooling sample entries (first 5 with a non-empty ndc): {_sample_entries}")
     remap = {}
     n_merged_groups = 0
     n_ndc9_pooled = 0
