@@ -1152,7 +1152,14 @@ CFG = {
     "dinov2_model_id": "facebook/dinov2-large",
     "proj_hidden_dim": 1024,
     "proj_embedding_dim": 512,
-    "proj_batch_p": 12,
+    # 12 -> 14: with PK_RX_QUOTA=7 + PK_OTC_QUOTA=4 = 11 of every 12 classes
+    # already guaranteed priority-tier, the general/long-tail pool was only
+    # getting 1 slot/batch. Widening to 14 keeps RX and OTC's quotas exactly
+    # as they were (the lever that just won +10.5pts RX / +8.7pts OTC) while
+    # giving long-tail classes 3 slots/batch instead of 1 -- a free lever,
+    # not a tradeoff against the priority-tier gains, since it doesn't
+    # shrink either quota.
+    "proj_batch_p": 14,
     "proj_batch_k": 4,
     "proj_epochs": 50,
     "proj_lr": 1e-3,
@@ -1937,19 +1944,16 @@ print("=" * 60, flush=True)
 
 # Split this session's budget between two phases: a short continuation of
 # head-only training (keeps the embedding space current/warmed up), then
-# the LoRA backbone fine-tune phase for the rest -- the phase that can
-# actually raise the accuracy ceiling instead of refining within it. If a
-# checkpoint already shows this is at least the 2nd session (resuming),
-# spend less time re-confirming the head and more on the new phase.
-# Trial 4 confirmed head-only training is saturated under the old sampler,
-# but the sampler itself just changed (OTC/RX-priority classes are now
-# heavily oversampled) -- give it 1.5h to re-stabilize under that new
-# distribution before switching to LoRA, rather than assuming the old
-# plateau still applies unchanged. Same reasoning applies again here: the
-# quota just changed a second time (5/5 -> 4/7), so give head-only 1.5h to
-# re-stabilize under the new RX-weighted distribution before LoRA -- now
-# affordable again with 6h total budgeted on the 30h-quota account.
-PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# the LoRA backbone fine-tune phase for the rest -- the phase that actually
+# drove the last run's real gains (+10.5pts RX / +8.7pts OTC top10), which
+# only got through 7/10 epochs before its budget ran out. This run's
+# checkpoint (trial-10) resumes into the SAME pooled-class label space
+# (133835 classes) as it was trained on, not a new one -- unlike last run,
+# there's no classifier-head reinit forcing a real re-stabilization need.
+# The only distribution change is proj_batch_p 12->14 (more long-tail
+# slots/batch), a mild shift -- 30min is enough to confirm the resume is
+# healthy under it, and the rest goes to LoRA to push further past epoch 7.
+PROJ_PHASE_SECONDS = 1800 if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
