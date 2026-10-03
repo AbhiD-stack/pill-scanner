@@ -866,10 +866,17 @@ def _build_visual_pool_remap():
             if not ndc or len(imprint) < 2 or not color:
                 continue
             _diag["passes_all_filters"] += 1
+            # No longer restricted to PRIORITY_NDC9_SET: the same shape-
+            # always-empty bug applies equally to long-tail NDCs, and
+            # long-tail RX is 63% of the entire test set (28710/45762 rows)
+            # -- by far the biggest single lever on the OVERALL accuracy
+            # number, not just priority tier. A priority NDC and a
+            # long-tail NDC that happen to share (imprint, color) really
+            # are the same physical-looking pill from different
+            # manufacturers either way, so merging across tiers is
+            # correct, not just permitted.
             ndc9 = normalize_ndc9(ndc)
-            if ndc9 not in PRIORITY_NDC9_SET:
-                continue
-            _diag["in_priority_set"] += 1
+            _diag["in_priority_set"] += 1 if ndc9 in PRIORITY_NDC9_SET else 0
             groups[(imprint, color)].add(ndc9)
     print(f"Visual pooling diagnostics: {_diag}")
     print(f"Visual pooling sample entries (first 5 with a non-empty ndc): {_sample_entries}")
@@ -891,14 +898,17 @@ def _build_visual_pool_remap():
 _visual_pool_remap, _n_merged_groups, _n_ndc9_pooled = _build_visual_pool_remap()
 if _visual_pool_remap:
     n_rows_remapped = 0
+    # No longer restricted to row["tier"] == "priority" -- see the
+    # reasoning in _build_visual_pool_remap() above. Long-tail rows get
+    # pooled too now, which is also the real lever on the OVERALL number.
     for row in manifest_rows:
-        if row["tier"] == "priority" and row["label"]:
+        if row["label"]:
             canonical = _visual_pool_remap.get(normalize_ndc9(row["label"]))
             if canonical and canonical != row["label"]:
                 row["label"] = canonical
                 n_rows_remapped += 1
     print(f"Visual pooling: merged {_n_ndc9_pooled} NDC9 classes into {_n_merged_groups} "
-          f"visually-identical groups (identical imprint+shape+color) -- remapped "
+          f"visually-identical groups (identical imprint+color, all tiers) -- remapped "
           f"{n_rows_remapped} image rows to their pooled class label.")
 else:
     print("Visual pooling: no NDC9 groups shared a matching (imprint, shape, color) -- "
