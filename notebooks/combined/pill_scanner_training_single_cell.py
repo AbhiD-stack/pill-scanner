@@ -878,10 +878,52 @@ def _build_visual_pool_remap():
             ndc9 = normalize_ndc9(ndc)
             _diag["in_priority_set"] += 1 if ndc9 in PRIORITY_NDC9_SET else 0
             groups[(imprint, color)].add(ndc9)
-    print(f"Visual pooling diagnostics: {_diag}")
+    print(f"Visual pooling diagnostics (RxNav source, 560 seed drugs only): {_diag}")
     print(f"Visual pooling sample entries (first 5 with a non-empty ndc): {_sample_entries}")
-    print("Visual pooling: matching on (imprint, color) only -- shape (SPLSHAPE) is "
-          "confirmed empty for this seed list from RxNav, not a normalization bug.")
+
+    # Second source: dailymed_metadata.json. The DailyMed acquisition
+    # notebook's own SPL parser (parse_spl_bytes in the acquisition script)
+    # already extracts SPLIMPRINT/SPLCOLOR/SPLSHAPE directly from the SPL
+    # XML for every one of its ~314k images -- covering RX+OTC, priority
+    # AND long-tail, unlike drug_metadata above which only ever has the
+    # 560 seed drugs RxNav was queried for. This file has existed in every
+    # run's output ("metadata present: True" has printed every single
+    # time) but was never actually read until now -- no new acquisition
+    # run needed, the data was already being downloaded. Also notably:
+    # DailyMed's own SPL characteristics DO populate shape (unlike RxNav's
+    # ndcproperties.json endpoint, which never does), so this source is
+    # higher-confidence on top of being far larger.
+    _dm_diag = {"total_entries": 0, "has_imprint_2plus": 0, "has_shape": 0,
+                "has_color": 0, "passes_filter": 0}
+    if DAILYMED_METADATA_PATH and DAILYMED_METADATA_PATH.exists():
+        _dm_metadata = json.load(open(DAILYMED_METADATA_PATH))
+        for ndc, e in _dm_metadata.items():
+            _dm_diag["total_entries"] += 1
+            imprint = (e.get("imprint") or "").strip().upper()
+            shape = (e.get("shape") or "").strip().upper()
+            color = (e.get("color") or "").strip().upper()
+            if len(imprint) >= 2:
+                _dm_diag["has_imprint_2plus"] += 1
+            if shape:
+                _dm_diag["has_shape"] += 1
+            if color:
+                _dm_diag["has_color"] += 1
+            if not ndc or len(imprint) < 2 or not color:
+                continue
+            _dm_diag["passes_filter"] += 1
+            # Same (imprint, color) key as the RxNav source above -- lets a
+            # DailyMed-sourced duplicate and an RxNav-sourced duplicate of
+            # the same real drug merge into one group too, not just within
+            # each source separately.
+            groups[(imprint, color)].add(normalize_ndc9(ndc))
+        print(f"Visual pooling diagnostics (DailyMed SPL source, all {_dm_diag['total_entries']} "
+              f"NDCs encountered during acquisition): {_dm_diag}")
+    else:
+        print("Visual pooling: dailymed_metadata.json not found -- skipping the DailyMed source "
+              "(only the 560-seed-drug RxNav source above is used this run).")
+    print("Visual pooling: matching on (imprint, color) only -- RxNav's ndcproperties.json "
+          "endpoint never returns shape for this seed list, confirmed via diagnostics above, "
+          "not a normalization bug.")
     remap = {}
     n_merged_groups = 0
     n_ndc9_pooled = 0
