@@ -1994,18 +1994,16 @@ print(f"Max epochs configured: {CFG['proj_epochs']} | Wall-clock budget: {MAX_TR
       f"(whichever limit hits first stops training and moves to export/gate)", flush=True)
 print("=" * 60, flush=True)
 
-# Split this session's budget between two phases: a short continuation of
-# head-only training (keeps the embedding space current/warmed up), then
-# the LoRA backbone fine-tune phase for the rest -- the phase that actually
-# drove the last run's real gains (+10.5pts RX / +8.7pts OTC top10), which
-# only got through 7/10 epochs before its budget ran out. This run's
-# checkpoint (trial-10) resumes into the SAME pooled-class label space
-# (133835 classes) as it was trained on, not a new one -- unlike last run,
-# there's no classifier-head reinit forcing a real re-stabilization need.
-# The only distribution change is proj_batch_p 12->14 (more long-tail
-# slots/batch), a mild shift -- 30min is enough to confirm the resume is
-# healthy under it, and the rest goes to LoRA to push further past epoch 7.
-PROJ_PHASE_SECONDS = 1800 if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# Bumped back up from 30min: this run wires in dailymed_metadata.json,
+# which reaches the full long-tail label space (126k+ classes) that the
+# RxNav-only pooling source structurally could never touch -- a much
+# bigger structural change to the class space than last run's batch_p
+# tweak, likely reinitializing the classifier head again (real class-count
+# change expected, not just a sampling-distribution shift). Give it a
+# real re-stabilization window before LoRA, same reasoning as the
+# original 1.5h allocation, not the trimmed-down 30min used when the
+# class space was known to be unchanged.
+PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
