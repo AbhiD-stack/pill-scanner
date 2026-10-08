@@ -226,11 +226,27 @@ def append_manifest_rows(rows):
 def merge_metadata(records):
     existing = json.load(open(METADATA_PATH)) if METADATA_PATH.exists() else {}
     for rec in records:
-        existing[rec.ndc] = {
+        new_fields = {
             "name": rec.name, "imprint": rec.imprint, "color": rec.color,
             "shape": rec.shape, "score_marks": rec.score_marks,
             "size_mm": rec.size_mm, "rx_or_otc": rec.rx_or_otc,
         }
+        prior = existing.get(rec.ndc)
+        if prior is None:
+            existing[rec.ndc] = new_fields
+        else:
+            # Confirmed live: DailyMed carries multiple SPL submissions over time
+            # for the same NDC (different labelers/revisions), and plenty of
+            # those re-submissions omit physical-characteristic data entirely.
+            # The old unconditional overwrite let a later, sparser document
+            # silently erase an earlier, richer one for the same NDC -- this
+            # is why real imprint/color/shape values extracted correctly from
+            # the XML (verified directly) were still coming out null in the
+            # final file. Only fill gaps now; never clobber an already-filled
+            # field with a later null.
+            for key, value in new_fields.items():
+                if value is not None and not prior.get(key):
+                    prior[key] = value
     json.dump(existing, open(METADATA_PATH, "w"), indent=0)
 
 MAX_IMAGE_DIM = 640  # plenty for a DINOv2-style model that resizes to ~224-518px anyway
