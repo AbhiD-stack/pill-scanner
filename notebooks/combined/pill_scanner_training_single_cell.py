@@ -1422,16 +1422,22 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # running that long without being killed), not remaining quota. Trial 4
 # gave real overhead numbers: pipeline 0.56h + export 1.1h + gate 0.65h =
 # 2.31h fixed, regardless of training time. Planning for 2.4h (slight
-# margin above observed) leaves 6.9h for training; using 6.5h keeps a
-# real ~35min buffer under the 9.5h ceiling rather than running at the edge.
-# Running on the 30h-quota account for this RX-rebalance experiment, not
-# the ~5h-remaining one -- Kaggle's single-session ceiling (~9.5h) is the
-# binding constraint again, not remaining quota. Fixed overhead (pipeline
-# ~45min + mandatory gallery re-embed ~1.6h since retraining changes the
-# weights + test-embed/deploy-modes gate ~15min + the full unrestricted
-# gate re-enabled below ~35min) is ~3.25h, leaving ~6h for training with
-# a real buffer under the session ceiling.
-MAX_TRAIN_SECONDS = int(6.0 * 3600)
+# Kaggle's actual single-session ceiling is 12h (43200s), confirmed directly
+# twice now (papermill's "Timeout waiting for execute reply (43200s)"), not
+# the ~9.5h this comment used to assume. The last real run's own timings:
+# data pipeline + name resolution + visual pooling took ~3.85h before
+# training even started, and training (1.5h proj + rest LoRA) ran to budget.
+# What killed that run was the gallery re-embedding step right after
+# training (export_artifacts' embed_rows call on the full 382k+ train+val
+# set) going silent with no further log output until the 12h kill -- almost
+# certainly the same OOM that the docstring on that call says killed the
+# previous two sessions too, just never actually fixed there (only the much
+# smaller downstream test-embedding call got the batch_size 64->32
+# mitigation). That's now fixed, plus embed_rows prints progress instead of
+# running silent, so a real stall is now visible instead of indistinguishable
+# from a dead kernel. Trimmed to 5.5h anyway (was 6h) for a bit more margin
+# while that fix is unproven on this larger corpus.
+MAX_TRAIN_SECONDS = int(5.5 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 100     # cheap periodic validation for best-checkpoint selection -- tightened from 200 so the last checkpoint before a time-budget stop is never more than ~100 batches stale
 
@@ -2163,6 +2169,15 @@ def embed_rows(rows, head, label_list, batch_size=64):
                 except Exception:
                     unreadable += 1
 
+    import time as _time_embed
+    _embed_start = _time_embed.time()
+    _n_processed = 0
+    # Confirmed live: this call runs completely silent on the ~382k-row
+    # gallery export with no print between it and training's last log line,
+    # so a kernel-level OOM death (no traceback -- the process is just gone)
+    # looks identical to the run still being alive and slow. A periodic
+    # progress line at least tells the next run's reader which one it is.
+    _progress_every = max(1, (len(rows) // batch_size) // 20 or 1)
     for row in rows:
         if row["label"] not in label_to_idx:
             skipped += 1
@@ -2177,6 +2192,11 @@ def embed_rows(rows, head, label_list, batch_size=64):
         if len(buf_imgs) >= batch_size:
             _flush()
             buf_imgs, buf_rows = [], []
+            _n_processed += 1
+            if _n_processed % _progress_every == 0:
+                elapsed = _time_embed.time() - _embed_start
+                print(f"  embed_rows: {_n_processed * batch_size}/{len(rows)} rows "
+                      f"({elapsed:.0f}s elapsed)", flush=True)
     _flush()
 
     if skipped:
@@ -2225,7 +2245,14 @@ def export_artifacts(head, label_list, gallery_rows, val_top5=None, prior_galler
         print(f"Reused prior gallery embeddings from {prior_gallery_path} "
               f"({gallery['embeddings'].shape[0]} rows) -- skipped re-embedding.")
     else:
-        gallery, _ = embed_rows(gallery_rows, head, label_list)
+        # batch_size dropped 64 -> 32, same fix already applied to the much
+        # smaller test-embedding call in Section 10. Confirmed via this
+        # function's own docstring: THIS exact call (the full 382k+ row
+        # gallery, 8x bigger than the test set) is the one that silently
+        # killed the previous sessions -- the OOM mitigation was only ever
+        # applied downstream of here, never to the bigger call that actually
+        # needed it.
+        gallery, _ = embed_rows(gallery_rows, head, label_list, batch_size=32)
     torch.save(gallery, EXPORT_DIR / "deployed_ref_embeddings.pt")
     print(f"Exported artifacts to {EXPORT_DIR}")
     return gallery
