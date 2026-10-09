@@ -168,7 +168,18 @@ def parse_spl_bytes(xml_bytes, rx_or_otc):
             continue
         name = _text(product.find(".//v3:name", SPL_NS))
         attrs = {"SPLCOLOR": [], "SPLIMPRINT": [], "SPLSHAPE": [], "SPLSCORE": [], "SPLSIZE": [], "SPLIMAGE": []}
-        for characteristic in product.iterfind(".//v3:subjectOf/v3:characteristic", SPL_NS):
+        # Physical characteristics (SPLCOLOR/SPLSHAPE/SPLIMPRINT/etc.) are SPL-schema
+        # siblings of this inner <manufacturedProduct>, not descendants of it -- they're
+        # children of the wrapping <manufacturedProduct> that also contains this one.
+        # Confirmed live: searching from `product` itself found formCode/ndc/name fine
+        # (those ARE inner-level) but found zero characteristics across the entire
+        # ~131k-record corpus, even though the raw XML genuinely has them for plenty of
+        # drugs (verified directly). Searching from the parent container instead; the
+        # ".//" there still covers any submitter that happens to nest them differently.
+        characteristic_scope = product.getparent()
+        if characteristic_scope is None:
+            characteristic_scope = product
+        for characteristic in characteristic_scope.iterfind(".//v3:subjectOf/v3:characteristic", SPL_NS):
             code_el = characteristic.find("./v3:code", SPL_NS)
             if code_el is None:
                 continue
