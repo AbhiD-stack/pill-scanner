@@ -1423,21 +1423,15 @@ MAX_BATCHES_PER_EPOCH = 800   # 800 * (proj_batch_p*proj_batch_k=48) ~= 38k imag
 # gave real overhead numbers: pipeline 0.56h + export 1.1h + gate 0.65h =
 # 2.31h fixed, regardless of training time. Planning for 2.4h (slight
 # Kaggle's actual single-session ceiling is 12h (43200s), confirmed directly
-# twice now (papermill's "Timeout waiting for execute reply (43200s)"), not
-# the ~9.5h this comment used to assume. The last real run's own timings:
-# data pipeline + name resolution + visual pooling took ~3.85h before
-# training even started, and training (1.5h proj + rest LoRA) ran to budget.
-# What killed that run was the gallery re-embedding step right after
-# training (export_artifacts' embed_rows call on the full 382k+ train+val
-# set) going silent with no further log output until the 12h kill -- almost
-# certainly the same OOM that the docstring on that call says killed the
-# previous two sessions too, just never actually fixed there (only the much
-# smaller downstream test-embedding call got the batch_size 64->32
-# mitigation). That's now fixed, plus embed_rows prints progress instead of
-# running silent, so a real stall is now visible instead of indistinguishable
-# from a dead kernel. Trimmed to 5.5h anyway (was 6h) for a bit more margin
-# while that fix is unproven on this larger corpus.
-MAX_TRAIN_SECONDS = int(5.5 * 3600)
+# Confirmed clean end-to-end on the real DailyMed-pooling run (31679s total,
+# no crash): fixed overhead (data pipeline ~27min now that pooling collapsed
+# 133,815 classes down to 31,277, making every per-row pass faster, + gallery
+# re-embed/test-embed/full-gate tail ~2.8h) was only ~3.27h, not the ~3.85h+
+# this comment used to assume from the pre-pooling-fix run. That leaves
+# ~8.7h for training under the 12h ceiling -- bumped up from 5.5h (which left
+# ~3.2h of that unused) to 8h, giving LoRA real room to finish all its
+# epochs instead of being cut mid-epoch-6/10 like last time.
+MAX_TRAIN_SECONDS = int(8.0 * 3600)
 PRINT_EVERY_N_BATCHES = 25    # frequent feedback instead of silence for a whole epoch
 VAL_EVERY_N_BATCHES = 100     # cheap periodic validation for best-checkpoint selection -- tightened from 200 so the last checkpoint before a time-budget stop is never more than ~100 batches stale
 
@@ -2000,16 +1994,14 @@ print(f"Max epochs configured: {CFG['proj_epochs']} | Wall-clock budget: {MAX_TR
       f"(whichever limit hits first stops training and moves to export/gate)", flush=True)
 print("=" * 60, flush=True)
 
-# Bumped back up from 30min: this run wires in dailymed_metadata.json,
-# which reaches the full long-tail label space (126k+ classes) that the
-# RxNav-only pooling source structurally could never touch -- a much
-# bigger structural change to the class space than last run's batch_p
-# tweak, likely reinitializing the classifier head again (real class-count
-# change expected, not just a sampling-distribution shift). Give it a
-# real re-stabilization window before LoRA, same reasoning as the
-# original 1.5h allocation, not the trimmed-down 30min used when the
-# class space was known to be unchanged.
-PROJ_PHASE_SECONDS = int(1.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
+# Trimmed back down from 1.5h: that allocation was for the run that wired in
+# dailymed_metadata.json and changed the class count from 133,815 to 31,277,
+# reinitializing the classifier head. This run resumes from THAT checkpoint
+# with no further pooling change, so the class count (31,277) should be
+# identical and classifier.weight/bias/arc_weight should load as-is, not
+# reinit -- no re-stabilization window needed. Freeing this time to LoRA,
+# which is where the marginal gains actually are at this point.
+PROJ_PHASE_SECONDS = int(0.5 * 3600) if PRIOR_CHECKPOINT_PATH else MAX_TRAIN_SECONDS
 LORA_PHASE_SECONDS = max(0, MAX_TRAIN_SECONDS - PROJ_PHASE_SECONDS)
 
 def find_prior_lora_adapter():
@@ -2687,14 +2679,12 @@ try:
                  "goal-check numbers below are from the restricted-gallery deploy_report above, "
                  "which is what the app actually ships.")
 
-        # Dual-side ("scan both sides") simulation -- disabled for this
-        # run. It's a real feature we want data on eventually, but it's
-        # ANOTHER full-gallery rerank pass stacked after two others above,
-        # and with only ~7h of GPU quota left after 3 straight crashes,
-        # getting the priority-tier and full-gate numbers onto disk
-        # safely matters more right now than this one. Flip back to True
-        # once a run completes cleanly through the point above.
-        RUN_DUAL_SIDE_SIM = False
+        # Dual-side ("scan both sides") simulation -- re-enabled now that a
+        # run has completed cleanly through the full gate above (the OOM fix
+        # held, budget had ~3.2h to spare). This is useful real signal for
+        # an app UX decision (does asking the user to scan both sides
+        # meaningfully help), not just a diagnostic.
+        RUN_DUAL_SIDE_SIM = True
         if RUN_DUAL_SIDE_SIM:
             dual_rows = build_dual_side_query_rows(query_rows)
             _log(f"\nDual-side (scan-both-sides) simulation: {len(dual_rows)} fused query pairs "
